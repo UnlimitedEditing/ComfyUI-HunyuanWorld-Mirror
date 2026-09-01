@@ -1472,7 +1472,11 @@ NODE_CLASS_MAPPINGS = {
     "HWMInference": HWMInference,
     "VisualizeDepth": VisualizeDepth,
     "VisualizeNormals": VisualizeNormals,
-    "SavePointCloud": SavePointCloud,
+    # Registered as "HWMSavePointCloud", not "SavePointCloud" -- ComfyUI core added
+    # its own native SavePointCloud node (comfy_extras/nodes_save_3d.py) after this
+    # pack was written, an exact NODE_CLASS_MAPPINGS key collision, and core's wins
+    # at registration time. Renaming the key (not the class name) is the minimal fix.
+    "HWMSavePointCloud": SavePointCloud,
     "Save3DGaussians": Save3DGaussians,
     "SaveDepthMap": SaveDepthMap,
     "SaveCameraParams": SaveCameraParams,
@@ -1486,7 +1490,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HWMInference": "HWM Inference",
     "VisualizeDepth": "Visualize Depth",
     "VisualizeNormals": "Visualize Normals",
-    "SavePointCloud": "Save Point Cloud",
+    "HWMSavePointCloud": "Save Point Cloud (HWM)",
     "Save3DGaussians": "Save 3D Gaussians",
     "SaveDepthMap": "Save Depth Map",
     "SaveCameraParams": "Save Camera Parameters",
