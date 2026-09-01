@@ -194,11 +194,13 @@
                         const opacities = new Float32Array(numGaussians);
                         const colors = new Float32Array(numGaussians * 3);
 
-                        // Read scales
+                        // Read scales -- scale_0-2 are stored in LOG-space (the standard
+                        // INRIA 3DGS PLY convention utils/export.py now follows), so undo
+                        // that with exp() here, same as every standard 3DGS viewer does.
                         for (let i = 0; i < numGaussians; i++) {
-                            scales[i * 3 + 0] = geometry.attributes.scale_0.array[i];
-                            scales[i * 3 + 1] = geometry.attributes.scale_1.array[i];
-                            scales[i * 3 + 2] = geometry.attributes.scale_2.array[i];
+                            scales[i * 3 + 0] = Math.exp(geometry.attributes.scale_0.array[i]);
+                            scales[i * 3 + 1] = Math.exp(geometry.attributes.scale_1.array[i]);
+                            scales[i * 3 + 2] = Math.exp(geometry.attributes.scale_2.array[i]);
                         }
 
                         // Read rotations (quaternion wxyz)
@@ -209,17 +211,19 @@
                             rotations[i * 4 + 3] = geometry.attributes.rot_3.array[i]; // z
                         }
 
-                        // Read opacities
+                        // Read opacities -- stored as a LOGIT, so undo with a sigmoid.
                         for (let i = 0; i < numGaussians; i++) {
-                            opacities[i] = geometry.attributes.opacity.array[i];
+                            opacities[i] = 1 / (1 + Math.exp(-geometry.attributes.opacity.array[i]));
                         }
 
-                        // Read colors (from f_dc_* or color attribute)
+                        // Read colors (from f_dc_* or color attribute) -- f_dc_0-2 are SH DC
+                        // coefficients, decoded via the standard color = 0.5 + SH_C0 * f_dc.
+                        const SH_C0 = 0.28209479177387814;
                         if (geometry.attributes.f_dc_0) {
                             for (let i = 0; i < numGaussians; i++) {
-                                colors[i * 3 + 0] = geometry.attributes.f_dc_0.array[i];
-                                colors[i * 3 + 1] = geometry.attributes.f_dc_1.array[i];
-                                colors[i * 3 + 2] = geometry.attributes.f_dc_2.array[i];
+                                colors[i * 3 + 0] = 0.5 + SH_C0 * geometry.attributes.f_dc_0.array[i];
+                                colors[i * 3 + 1] = 0.5 + SH_C0 * geometry.attributes.f_dc_1.array[i];
+                                colors[i * 3 + 2] = 0.5 + SH_C0 * geometry.attributes.f_dc_2.array[i];
                             }
                         } else if (geometry.attributes.color) {
                             colors.set(geometry.attributes.color.array);

@@ -323,6 +323,32 @@ class ExportUtils:
         # Reshape opacities to 2D for PLY export (already filtered and flattened)
         opacities = opacities.reshape(-1, 1)
 
+        # --- Encode scale/opacity/color into the standard INRIA 3DGS PLY convention ---
+        # This exporter was writing scale/opacity/f_dc as plain linear values, but every
+        # standard 3DGS viewer (gaussian-splats-3d, drei's <Splat>, supersplat, the
+        # original INRIA viewer) expects scale_0-2 in LOG-space and opacity as a LOGIT,
+        # undoing them via exp()/sigmoid() on load -- confirmed by reading
+        # gaussian-splats-3d's own parser source (INRIAV1PlyParser.readSplat: applies
+        # Math.exp() to scale_N and a sigmoid to opacity). Writing already-linear values
+        # meant a real scale of ~0.002 (appropriately small relative to a scene spanning
+        # only ~1-2 world units) got re-exponentiated to ~exp(0.002) =~ 1.0 -- roughly the
+        # size of the ENTIRE scene, for every single splat. That's what turned a real
+        # 167k-splat hallway reconstruction into one giant featureless blob when opened in
+        # 3DGenStudio's viewer. This repo's own bundled web/index.html viewer was written
+        # to match this same (non-standard) raw encoding, so it needs the mirrored fix too
+        # -- see the exp()/sigmoid() calls added there alongside this change.
+        #
+        # f_dc (the color viewers actually read, as opposed to the red/green/blue uint8
+        # fallback) has the same issue: the standard convention is
+        # color = 0.5 + SH_C0 * f_dc, so f_dc must be the SH DC coefficient, not a plain
+        # [0,1] color -- inverted here as (color - 0.5) / SH_C0.
+        SH_C0 = 0.28209479177387814
+        scale_epsilon = 1e-8
+        opacity_epsilon = 1e-6
+        scales_log = np.log(np.maximum(scales, scale_epsilon)).astype(np.float32)
+        opacities_clamped = np.clip(opacities, opacity_epsilon, 1.0 - opacity_epsilon)
+        opacities_logit = np.log(opacities_clamped / (1.0 - opacities_clamped)).astype(np.float32)
+
         # Build vertex data
         vertex_data = [
             ('x', means[:, 0]),
@@ -339,23 +365,24 @@ class ExportUtils:
             ('blue', colors_255[:, 2]),
         ])
 
-        # Add 3DGS-specific attributes
+        # Add 3DGS-specific attributes (log-space scale, logit-space opacity -- see note above)
         vertex_data.extend([
-            ('scale_0', scales[:, 0]),
-            ('scale_1', scales[:, 1]),
-            ('scale_2', scales[:, 2]),
+            ('scale_0', scales_log[:, 0]),
+            ('scale_1', scales_log[:, 1]),
+            ('scale_2', scales_log[:, 2]),
             ('rot_0', quats[:, 0]),  # w
             ('rot_1', quats[:, 1]),  # x
             ('rot_2', quats[:, 2]),  # y
             ('rot_3', quats[:, 3]),  # z
-            ('opacity', opacities[:, 0]),
+            ('opacity', opacities_logit[:, 0]),
         ])
 
         # Add colors or spherical harmonics in 3DGS format
         if sh is not None:
             # Flatten SH coefficients
             sh_flat = sh.reshape(num_gaussians, -1).astype(np.float32)
-            # First 3 coefficients are DC term (f_dc_0, f_dc_1, f_dc_2)
+            # First 3 coefficients are DC term (f_dc_0, f_dc_1, f_dc_2) -- already true SH
+            # coefficients from the model, not a plain color, so no conversion needed here.
             vertex_data.extend([
                 ('f_dc_0', sh_flat[:, 0]),
                 ('f_dc_1', sh_flat[:, 1]),
@@ -365,11 +392,13 @@ class ExportUtils:
             for i in range(3, sh_flat.shape[1]):
                 vertex_data.append((f'f_rest_{i-3}', sh_flat[:, i]))
         else:
-            # Simple RGB colors in 3DGS format (normalized [0,1])
+            # Plain RGB colors, not real SH coefficients -- encode as the SH DC term a
+            # standard viewer expects: color = 0.5 + SH_C0 * f_dc.
+            f_dc = ((colors - 0.5) / SH_C0).astype(np.float32)
             vertex_data.extend([
-                ('f_dc_0', colors[:, 0]),
-                ('f_dc_1', colors[:, 1]),
-                ('f_dc_2', colors[:, 2]),
+                ('f_dc_0', f_dc[:, 0]),
+                ('f_dc_1', f_dc[:, 1]),
+                ('f_dc_2', f_dc[:, 2]),
             ])
 
         # Create structured array
