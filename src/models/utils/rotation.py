@@ -1,6 +1,25 @@
 # Rotation utilities for quaternions and rotation matrices
 # References:
 #   https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/transforms/rotation_conversions.py
+#
+# CONFIRMED LIVE BUG then fix (2026-09-02): quat_to_rotmat/rotmat_to_quat below were
+# a from-scratch reimplementation using scalar-FIRST (w,x,y,z) component order. The
+# actual tencent/HunyuanWorld-Mirror pretrained weights were trained against Tencent's
+# own official demo code (huggingface.co/spaces/tencent/HunyuanWorld-Mirror,
+# src/models/utils/rotation.py, fetched and diffed directly), whose quat_to_rotmat
+# docstring explicitly states "Quaternion Order: XYZW or say ijkr, scalar-last".
+# camera_utils.py (unchanged from official, confirmed byte-identical) feeds the
+# cam_head's raw learned 9-dim output vector straight through rotmat_to_quat/
+# quat_to_rotmat with NO reordering of its own -- so every element the pretrained
+# camera-pose head learned to mean was being misread by a scalar-first formula here,
+# producing a wrong rotation matrix for every predicted camera pose on every single
+# inference run (not just multi-view: worldmirror.py calls this in the default,
+# no-prior path via transform_camera_vector, forward() lines ~176-181). This is a
+# strong root-cause candidate for the "wildly inaccurate, even on a single image"
+# quality gap versus the official demo -- camera pose feeds directly into how every
+# point/Gaussian gets placed in world space. Replaced below with Tencent's official
+# implementation verbatim (same function names/signatures, so camera_utils.py and
+# every other call site needed zero changes).
 
 import torch
 import torch.nn.functional as F
@@ -8,106 +27,104 @@ import torch.nn.functional as F
 
 def quat_to_rotmat(quaternions: torch.Tensor) -> torch.Tensor:
     """
-    Convert quaternions to rotation matrices.
+    Quaternion Order: XYZW or say ijkr, scalar-last
 
+    Convert rotations given as quaternions to rotation matrices.
     Args:
-        quaternions: Tensor of shape (..., 4) containing quaternions in wxyz format
+        quaternions: quaternions with real part last,
+            as tensor of shape (..., 4).
 
     Returns:
-        Rotation matrices of shape (..., 3, 3)
+        Rotation matrices as tensor of shape (..., 3, 3).
     """
-    # Normalize quaternion
-    quaternions = F.normalize(quaternions, p=2, dim=-1)
+    i, j, k, r = torch.unbind(quaternions, -1)
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
 
-    w, x, y, z = torch.unbind(quaternions, -1)
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
+    )
+    return o.reshape(quaternions.shape[:-1] + (3, 3))
 
-    # Compute rotation matrix components
-    wx = w * x
-    wy = w * y
-    wz = w * z
-    xx = x * x
-    xy = x * y
-    xz = x * z
-    yy = y * y
-    yz = y * z
-    zz = z * z
 
-    # Build rotation matrix
-    rotmat = torch.stack([
-        torch.stack([1 - 2*(yy + zz), 2*(xy - wz), 2*(xz + wy)], dim=-1),
-        torch.stack([2*(xy + wz), 1 - 2*(xx + zz), 2*(yz - wx)], dim=-1),
-        torch.stack([2*(xz - wy), 2*(yz + wx), 1 - 2*(xx + yy)], dim=-1)
-    ], dim=-2)
+def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
+    """Returns torch.sqrt(torch.max(0, x)) but with a zero subgradient where x is 0."""
+    ret = torch.zeros_like(x)
+    positive_mask = x > 0
+    if torch.is_grad_enabled():
+        ret[positive_mask] = torch.sqrt(x[positive_mask])
+    else:
+        ret = torch.where(positive_mask, torch.sqrt(x), ret)
+    return ret
 
-    return rotmat
+
+def standardize_quaternion(quaternions: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a unit quaternion to a standard form: one in which the real
+    part (last, scalar-last convention) is non negative.
+    """
+    return torch.where(quaternions[..., 3:4] < 0, -quaternions, quaternions)
 
 
 def rotmat_to_quat(rotmat: torch.Tensor) -> torch.Tensor:
     """
-    Convert rotation matrices to quaternions.
+    Convert rotations given as rotation matrices to quaternions.
 
     Args:
-        rotmat: Rotation matrices of shape (..., 3, 3)
+        rotmat: Rotation matrices as tensor of shape (..., 3, 3).
 
     Returns:
-        Quaternions of shape (..., 4) in wxyz format
+        Quaternions with real part last, as tensor of shape (..., 4).
+        Quaternion Order: XYZW or say ijkr, scalar-last
     """
-    # Based on "Converting a Rotation Matrix to a Quaternion" by Mike Day
-    # https://d3cw3dd2w32x2b.cloudfront.net/wp-content/uploads/2015/01/matrix-to-quat.pdf
+    if rotmat.size(-1) != 3 or rotmat.size(-2) != 3:
+        raise ValueError(f"Invalid rotation matrix shape {rotmat.shape}.")
 
-    batch_shape = rotmat.shape[:-2]
-    rotmat = rotmat.reshape(-1, 3, 3)
+    batch_dim = rotmat.shape[:-2]
+    m00, m01, m02, m10, m11, m12, m20, m21, m22 = torch.unbind(rotmat.reshape(batch_dim + (9,)), dim=-1)
 
-    # Extract rotation matrix elements
-    m00, m01, m02 = rotmat[:, 0, 0], rotmat[:, 0, 1], rotmat[:, 0, 2]
-    m10, m11, m12 = rotmat[:, 1, 0], rotmat[:, 1, 1], rotmat[:, 1, 2]
-    m20, m21, m22 = rotmat[:, 2, 0], rotmat[:, 2, 1], rotmat[:, 2, 2]
+    q_abs = _sqrt_positive_part(
+        torch.stack(
+            [1.0 + m00 + m11 + m22, 1.0 + m00 - m11 - m22, 1.0 - m00 + m11 - m22, 1.0 - m00 - m11 + m22], dim=-1
+        )
+    )
 
-    # Compute trace
-    trace = m00 + m11 + m22
+    # we produce the desired quaternion multiplied by each of r, i, j, k
+    quat_by_rijk = torch.stack(
+        [
+            torch.stack([q_abs[..., 0] ** 2, m21 - m12, m02 - m20, m10 - m01], dim=-1),
+            torch.stack([m21 - m12, q_abs[..., 1] ** 2, m10 + m01, m02 + m20], dim=-1),
+            torch.stack([m02 - m20, m10 + m01, q_abs[..., 2] ** 2, m12 + m21], dim=-1),
+            torch.stack([m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3] ** 2], dim=-1),
+        ],
+        dim=-2,
+    )
 
-    # Initialize quaternion tensor
-    quat = torch.zeros(rotmat.shape[0], 4, dtype=rotmat.dtype, device=rotmat.device)
+    # We floor here at 0.1 but the exact level is not important; if q_abs is small,
+    # the candidate won't be picked.
+    flr = torch.tensor(0.1).to(dtype=q_abs.dtype, device=q_abs.device)
+    quat_candidates = quat_by_rijk / (2.0 * q_abs[..., None].max(flr))
 
-    # Case 1: trace > 0
-    mask1 = trace > 0
-    s = torch.sqrt(trace[mask1] + 1.0) * 2  # s = 4 * w
-    quat[mask1, 0] = 0.25 * s
-    quat[mask1, 1] = (m21[mask1] - m12[mask1]) / s
-    quat[mask1, 2] = (m02[mask1] - m20[mask1]) / s
-    quat[mask1, 3] = (m10[mask1] - m01[mask1]) / s
+    # if not for numerical problems, quat_candidates[i] should be same (up to a sign),
+    # forall i; we pick the best-conditioned one (with the largest denominator)
+    out = quat_candidates[F.one_hot(q_abs.argmax(dim=-1), num_classes=4) > 0.5, :].reshape(batch_dim + (4,))
 
-    # Case 2: m00 > m11 and m00 > m22
-    mask2 = (~mask1) & (m00 > m11) & (m00 > m22)
-    s = torch.sqrt(1.0 + m00[mask2] - m11[mask2] - m22[mask2]) * 2  # s = 4 * x
-    quat[mask2, 0] = (m21[mask2] - m12[mask2]) / s
-    quat[mask2, 1] = 0.25 * s
-    quat[mask2, 2] = (m01[mask2] + m10[mask2]) / s
-    quat[mask2, 3] = (m02[mask2] + m20[mask2]) / s
+    # Convert from rijk to ijkr
+    out = out[..., [1, 2, 3, 0]]
 
-    # Case 3: m11 > m22
-    mask3 = (~mask1) & (~mask2) & (m11 > m22)
-    s = torch.sqrt(1.0 + m11[mask3] - m00[mask3] - m22[mask3]) * 2  # s = 4 * y
-    quat[mask3, 0] = (m02[mask3] - m20[mask3]) / s
-    quat[mask3, 1] = (m01[mask3] + m10[mask3]) / s
-    quat[mask3, 2] = 0.25 * s
-    quat[mask3, 3] = (m12[mask3] + m21[mask3]) / s
+    out = standardize_quaternion(out)
 
-    # Case 4: m22 is largest
-    mask4 = (~mask1) & (~mask2) & (~mask3)
-    s = torch.sqrt(1.0 + m22[mask4] - m00[mask4] - m11[mask4]) * 2  # s = 4 * z
-    quat[mask4, 0] = (m10[mask4] - m01[mask4]) / s
-    quat[mask4, 1] = (m02[mask4] + m20[mask4]) / s
-    quat[mask4, 2] = (m12[mask4] + m21[mask4]) / s
-    quat[mask4, 3] = 0.25 * s
-
-    # Reshape back to original batch shape
-    quat = quat.reshape(*batch_shape, 4)
-
-    # Normalize quaternion
-    quat = F.normalize(quat, p=2, dim=-1)
-
-    return quat
+    return out
 
 
 def quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
