@@ -22,6 +22,7 @@ from .utils import (
     tensor_to_numpy,
 )
 from .utils.inference import load_model
+from .utils.edge_mask import depth_edge, normals_edge
 
 
 # ============================================================================
@@ -198,8 +199,8 @@ class LoadHunyuanWorldMirrorModel:
                     "tooltip": "Which device to run the model on. 'auto' selects CUDA if available, otherwise CPU. Use 'cuda' for GPU acceleration (recommended) or 'cpu' for compatibility."
                 }),
                 "precision": (["fp32", "fp16", "bf16"], {
-                    "default": "fp16",
-                    "tooltip": "Numeric precision for model weights. fp16 (half precision) uses less memory and is faster, fp32 (full precision) is more accurate, bf16 (bfloat16) balances both on supported GPUs."
+                    "default": "bf16",
+                    "tooltip": "Numeric precision for model weights. bf16 (bfloat16) matches Tencent's own official demo (app.py) and has much better dynamic range than fp16 for this model's Gaussian scale/rotation predictions -- fp16 overflow on uncertain/extreme predictions is a plausible source of streaky splat artifacts. fp32 is more accurate still but uses 2x the memory of bf16. Falls back to fp32 automatically on GPUs without bf16 support."
                 }),
                 "force_reload": ("BOOLEAN", {
                     "default": False,
@@ -737,6 +738,27 @@ class SavePointCloud:
                 "confidence": ("*", {
                     "tooltip": "Optional: Confidence values for each point from HWM Inference (pts3d_conf output). Used with confidence_threshold to filter low-quality points."
                 }),
+                "depth": ("DEPTH", {
+                    "tooltip": "Optional: Depth map from HWM Inference. Required (along with normals) for apply_edge_mask -- removes 'flying pixel' points at depth/normal discontinuities, the same technique Tencent's own official demo (app.py) uses before export."
+                }),
+                "apply_edge_mask": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Remove points at depth/normal discontinuities (silhouette edges, where triangulation is unreliable) before export. Matches Tencent's official demo behavior. Requires both depth and normals to be connected."
+                }),
+                "edge_normal_threshold": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 90.0,
+                    "step": 0.5,
+                    "tooltip": "Normal-angle discontinuity tolerance in degrees (official demo default: 5.0). Lower = more aggressive edge removal."
+                }),
+                "edge_depth_threshold": ("FLOAT", {
+                    "default": 0.03,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.005,
+                    "tooltip": "Relative depth discontinuity tolerance (official demo default: 0.03). Lower = more aggressive edge removal."
+                }),
             },
         }
 
@@ -755,7 +777,11 @@ class SavePointCloud:
         subsample_factor: int,
         colors: Optional[torch.Tensor] = None,
         normals: Optional[torch.Tensor] = None,
-        confidence: Optional[torch.Tensor] = None
+        confidence: Optional[torch.Tensor] = None,
+        depth: Optional[torch.Tensor] = None,
+        apply_edge_mask: bool = True,
+        edge_normal_threshold: float = 5.0,
+        edge_depth_threshold: float = 0.03
     ) -> Tuple[str]:
         """Save point cloud to file with optional confidence filtering and subsampling."""
 
@@ -854,6 +880,47 @@ class SavePointCloud:
                 normals_torch = normals_torch.permute(0, 2, 3, 1)
                 normals_np = normals_torch.numpy()
 
+        # Depth/normal discontinuity ("flying pixel") edge masking, ported from
+        # Tencent's own official demo (app.py) -- see utils/edge_mask.py. Applied
+        # here (points3d), not to Save3DGaussians: the model's internal prune_gs
+        # voxel-merge already reorders/dedupes exported Gaussians away from a
+        # per-pixel grid by the time they reach this node pack, so there is no
+        # valid per-pixel correspondence left to mask against on the splat path --
+        # the official demo doesn't apply this to splats either, only to points3d.
+        edge_valid_mask = None
+        if apply_edge_mask and depth is not None and normals_np is not None:
+            depth_np = tensor_to_numpy(depth)
+            # Normalize depth to [num_frames, H, W]
+            if depth_np.ndim == 5:
+                depth_np = depth_np.squeeze(0)
+                if depth_np.shape[-1] == 1:
+                    depth_np = depth_np.squeeze(-1)
+            elif depth_np.ndim == 4:
+                if depth_np.shape[-1] == 1:
+                    depth_np = depth_np.squeeze(-1)
+
+            # Normalize normals_np (already resized to match points3d's H,W above) to [num_frames, H, W, 3]
+            normals_for_edge = normals_np
+            if normals_for_edge.ndim == 5:
+                normals_for_edge = normals_for_edge.squeeze(0)
+
+            pts_h, pts_w = points_np.shape[-3], points_np.shape[-2]
+            if depth_np.shape[-2:] != (pts_h, pts_w):
+                depth_torch = torch.from_numpy(depth_np).unsqueeze(1)  # [N,1,H,W]
+                depth_torch = torch.nn.functional.interpolate(depth_torch, size=(pts_h, pts_w), mode='bilinear', align_corners=False)
+                depth_np = depth_torch.squeeze(1).numpy()
+
+            if depth_np.shape[0] == normals_for_edge.shape[0]:
+                per_frame_masks = []
+                for i in range(depth_np.shape[0]):
+                    d_edges = depth_edge(depth_np[i], rtol=edge_depth_threshold)
+                    n_edges = normals_edge(normals_for_edge[i], tol=edge_normal_threshold)
+                    per_frame_masks.append(~(d_edges & n_edges))
+                edge_valid_mask = np.stack(per_frame_masks, axis=0)  # [N, H, W]
+                print(f"  Edge mask computed: {edge_valid_mask.sum()}/{edge_valid_mask.size} pixels kept (normal_tol={edge_normal_threshold} deg, depth_rtol={edge_depth_threshold})")
+            else:
+                print(f"  Warning: depth frame count ({depth_np.shape[0]}) != normals frame count ({normals_for_edge.shape[0]}) -- skipping edge mask")
+
         # Apply subsampling if requested
         if subsample_factor > 1:
             # Flatten all arrays to 1D list of points
@@ -878,6 +945,10 @@ class SavePointCloud:
                 confidence_flat = confidence_np.reshape(-1)
                 confidence_np = confidence_flat[subsample_mask].reshape(-1)
 
+            if edge_valid_mask is not None:
+                edge_flat = edge_valid_mask.reshape(-1)
+                edge_valid_mask = edge_flat[subsample_mask]
+
             print(f"  Subsampling: {subsample_mask.sum()}/{num_original} points (factor={subsample_factor})")
 
         # Ensure file extension matches format
@@ -889,7 +960,8 @@ class SavePointCloud:
             saved_path = ExportUtils.save_point_cloud_ply(
                 filepath, points_np, colors_np, normals_np,
                 confidence=confidence_np,
-                confidence_threshold=confidence_threshold
+                confidence_threshold=confidence_threshold,
+                edge_valid_mask=edge_valid_mask
             )
         elif format == "obj":
             saved_path = ExportUtils.save_point_cloud_obj(

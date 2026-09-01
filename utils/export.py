@@ -36,7 +36,8 @@ class ExportUtils:
         normals: Optional[np.ndarray] = None,
         binary: bool = True,
         confidence: Optional[np.ndarray] = None,
-        confidence_threshold: float = 0.0
+        confidence_threshold: float = 0.0,
+        edge_valid_mask: Optional[np.ndarray] = None
     ) -> str:
         """
         Save point cloud to PLY file with automatic validity filtering.
@@ -49,6 +50,9 @@ class ExportUtils:
             binary: Save in binary format (more compact)
             confidence: Confidence values [N] (optional)
             confidence_threshold: Minimum confidence percentile (0-100, default 0=keep all)
+            edge_valid_mask: Boolean keep-mask [N] from depth/normal discontinuity
+                detection (utils/edge_mask.py), same mechanism Tencent's own demo
+                app.py uses on points3d before export (optional)
 
         Returns:
             filepath: Path to saved file
@@ -75,6 +79,11 @@ class ExportUtils:
             confidence_mask = confidence >= conf_percentile
             valid_mask = valid_mask & confidence_mask
             print(f"  Confidence filtering: {confidence_mask.sum()}/{len(confidence)} points above {confidence_threshold}th percentile")
+
+        if edge_valid_mask is not None:
+            edge_valid_mask = edge_valid_mask.reshape(-1)
+            valid_mask = valid_mask & edge_valid_mask
+            print(f"  Edge filtering: {edge_valid_mask.sum()}/{len(edge_valid_mask)} points not on a depth/normal discontinuity")
 
         points = points[valid_mask]
 
