@@ -23,6 +23,9 @@ from .utils import (
 )
 from .utils.inference import load_model
 from .utils.edge_mask import depth_edge, normals_edge
+from .utils.sky_segmentation import download_skyseg_model, segment_sky_mask
+from .utils.flythrough import render_gaussian_flythrough
+from .utils.scene_composite import build_composite_scene
 
 
 # ============================================================================
@@ -1535,6 +1538,348 @@ class View3DInBrowser:
 
 
 # ============================================================================
+# Node: SkySegmentation
+# ============================================================================
+
+class SkySegmentation:
+    """
+    Segments sky from images using Tencent's official demo's ONNX model
+    (JianyuanWang/skyseg, via visual_util.py::segment_sky -- ported directly).
+
+    Matters for outdoor scenes: unmasked sky pixels have no real depth (the
+    model still has to guess *something*), producing unconstrained/runaway
+    geometry. Feed this mask into HWMSavePointCloud/SaveCompositeScene's
+    sky_mask input to filter it out before export.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Source images to segment (the same batch fed into HWMInference)."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("sky_mask",)
+    FUNCTION = "segment"
+    CATEGORY = "HunyuanWorld-Mirror/preprocessing"
+
+    _onnx_session = None
+
+    @classmethod
+    def _get_session(cls):
+        if cls._onnx_session is not None:
+            return cls._onnx_session
+        import onnxruntime
+        import folder_paths
+        model_path = os.path.join(folder_paths.models_dir, "skyseg", "skyseg.onnx")
+        download_skyseg_model(model_path)
+        cls._onnx_session = onnxruntime.InferenceSession(model_path)
+        return cls._onnx_session
+
+    def segment(self, images: torch.Tensor) -> Tuple[torch.Tensor]:
+        session = self._get_session()
+        images_np = tensor_to_numpy(images)  # [N, H, W, 3] float [0,1]
+
+        masks = []
+        for i in range(images_np.shape[0]):
+            keep_mask = segment_sky_mask(images_np[i], session)  # HxW bool, True=non-sky
+            masks.append(torch.from_numpy(keep_mask.astype(np.float32)))
+
+        return (torch.stack(masks, dim=0),)
+
+
+# ============================================================================
+# Node: RenderGaussianFlythrough
+# ============================================================================
+
+class RenderGaussianFlythrough:
+    """
+    Renders an actual camera-flythrough video through the reconstructed
+    Gaussians, using the model's own real-time rasterizer (model.gs_renderer),
+    ported from Tencent's official demo (src/utils/render_utils.py --
+    render_interpolated_video).
+
+    This is the real gap between "export a raw Gaussian PLY and hope a
+    third-party WebGL viewer interprets it correctly" and how the official
+    demo actually presents its results: a properly rendered video, not a
+    static point dump handed to an external renderer.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("HWMIRROR_MODEL", {
+                    "tooltip": "The loaded model from LoadHunyuanWorldMirrorModel -- its gs_renderer does the actual rendering."
+                }),
+                "gaussians": ("GAUSSIANS", {
+                    "tooltip": "Gaussian splat parameters from HWMInference."
+                }),
+                "camera_poses": ("POSES", {
+                    "tooltip": "Camera-to-world matrices from HWMInference."
+                }),
+                "camera_intrinsics": ("INTRINSICS", {
+                    "tooltip": "Camera intrinsic matrices from HWMInference."
+                }),
+                "width": ("INT", {"default": 518, "min": 64, "max": 4096, "tooltip": "Render width -- should match the preprocessed image width."}),
+                "height": ("INT", {"default": 518, "min": 64, "max": 4096, "tooltip": "Render height -- should match the preprocessed image height."}),
+                "interp_per_pair": ("INT", {
+                    "default": 20, "min": 1, "max": 120,
+                    "tooltip": "Interpolated frames inserted between each pair of real camera poses (multi-view input), or density of the synthesized orbit for single-image input."
+                }),
+                "loop_reverse": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Append the reversed sequence so the video loops seamlessly back to its start."
+                }),
+                "apply_spread_effect": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Play the 'Spread' reveal effect (the scene materializes outward from center with a color trail) continuously across the flythrough -- the one cosmetic flourish actually wired up in the official demo's own gs_effects.py."
+                }),
+                "effect_speed": ("FLOAT", {
+                    "default": 0.04, "min": 0.001, "max": 1.0, "step": 0.001,
+                    "tooltip": "How fast the Spread effect's internal clock advances per frame. Official demo default: 0.04."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("rgb_frames", "depth_frames")
+    FUNCTION = "render"
+    CATEGORY = "HunyuanWorld-Mirror/output"
+
+    def render(
+        self,
+        model,
+        gaussians: Dict[str, torch.Tensor],
+        camera_poses: torch.Tensor,
+        camera_intrinsics: torch.Tensor,
+        width: int,
+        height: int,
+        interp_per_pair: int,
+        loop_reverse: bool,
+        apply_spread_effect: bool,
+        effect_speed: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if gaussians is None or gaussians.get('means') is None:
+            print("Warning: Gaussian parameters not available - skipping flythrough render")
+            placeholder = torch.zeros((1, height, width, 3))
+            return (placeholder, placeholder)
+
+        gs_renderer = getattr(model, "gs_renderer", None)
+        if gs_renderer is None:
+            raise ValueError(
+                "model has no gs_renderer attribute -- RenderGaussianFlythrough needs the "
+                "raw WorldMirror model instance from LoadHunyuanWorldMirrorModel, not a "
+                "pre-processed gaussians dict."
+            )
+
+        # Same colors-from-SH-DC-term fallback as Save3DGaussians (nodes.py's
+        # own save() method) -- HWMInference's raw gaussians dict has
+        # colors=None; the real per-Gaussian RGB lives in the first 3 channels
+        # of 'sh' (already plain [0,1] RGB here, not a real spherical-harmonics
+        # basis needing the SH_C0 decode -- confirmed by that existing,
+        # previously-verified code path, so mirrored verbatim rather than
+        # re-derived).
+        colors = gaussians.get('colors', None)
+        if colors is None:
+            sh_tensor = gaussians.get('sh', None)
+            if sh_tensor is not None and sh_tensor.shape[-1] >= 3:
+                colors = sh_tensor[..., :3]
+        if colors is None:
+            raise ValueError("gaussians dict has neither 'colors' nor a usable 'sh' DC term -- cannot render.")
+        # 'sh' carries a singleton SH-coefficient axis (degree 0 -> shape
+        # [..., N, 1, 3]) that numpy code elsewhere flattens away harmlessly
+        # via .reshape(-1, 3) at export time -- squeeze it explicitly here
+        # since nothing downstream in this torch path does that reshape.
+        if colors.dim() == 4 and colors.shape[-2] == 1:
+            colors = colors.squeeze(-2)
+
+        # Ensure batch dimension: gaussians as produced by HWMInference already
+        # carry [1, N, ...]; camera_poses/intrinsics too.
+        means = gaussians['means']
+        if means.dim() == 2:
+            means = means.unsqueeze(0)
+        # 'opacities' is scalar-per-point (no channel axis), so a batched
+        # tensor is 2D ([1, N]) where means/quats/scales/colors are 3D when
+        # batched ([1, N, C]) -- unbatched is one dim lower in each case.
+        # Blanket-checking dim()==2 for all of them double-batches opacities.
+        splats = {
+            'means': means,
+            'quats': gaussians['quats'].unsqueeze(0) if gaussians['quats'].dim() == 2 else gaussians['quats'],
+            'scales': gaussians['scales'].unsqueeze(0) if gaussians['scales'].dim() == 2 else gaussians['scales'],
+            'opacities': gaussians['opacities'].unsqueeze(0) if gaussians['opacities'].dim() == 1 else gaussians['opacities'],
+            'colors': colors.unsqueeze(0) if colors.dim() == 2 else colors,
+        }
+
+        cam_poses = camera_poses if camera_poses.dim() == 4 else camera_poses.unsqueeze(0)
+        cam_intr = camera_intrinsics if camera_intrinsics.dim() == 4 else camera_intrinsics.unsqueeze(0)
+
+        rgb_frames, depth_frames = render_gaussian_flythrough(
+            gs_renderer=gs_renderer,
+            splats=splats,
+            camtoworlds=cam_poses,
+            intrinsics=cam_intr,
+            hw=(height, width),
+            interp_per_pair=interp_per_pair,
+            loop_reverse=loop_reverse,
+            apply_spread_effect=apply_spread_effect,
+            effect_speed=effect_speed,
+        )
+
+        return (rgb_frames.cpu().float(), depth_frames.cpu().float())
+
+
+# ============================================================================
+# Node: SaveCompositeScene
+# ============================================================================
+
+class SaveCompositeScene:
+    """
+    Assembles a single GLB scene from the raw per-pixel reconstruction (a
+    real textured mesh per view, or a merged point cloud) plus color-coded
+    camera-frustum markers for every view -- ported from Tencent's official
+    demo (src/utils/visual_util.py::convert_predictions_to_glb_scene).
+
+    This is the "stage it, animate a virtual camera" deliverable: a GLB you
+    can actually drop into Blender, the Three.js Editor, or 3DGenStudio's own
+    mesh pipeline, with real camera objects included -- not a Gaussian splat
+    PLY that needs special-case viewer support.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "points3d": ("POINTS3D", {
+                    "tooltip": "3D point coordinates from HWMInference."
+                }),
+                "images": ("IMAGE", {
+                    "tooltip": "Source images (for mesh/point-cloud vertex colors)."
+                }),
+                "camera_poses": ("POSES", {
+                    "tooltip": "Camera-to-world matrices from HWMInference -- placed into the scene as frustum markers."
+                }),
+                "filepath": ("STRING", {
+                    "default": "./output/hwm_composite_scene.glb",
+                    "multiline": False,
+                }),
+                "as_mesh": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Build a real textured mesh per view (True) instead of a single merged point cloud (False)."
+                }),
+                "show_camera": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Add a color-coded frustum marker mesh for each camera view."
+                }),
+            },
+            "optional": {
+                "normals": ("NORMALS", {
+                    "tooltip": "Optional surface normals, same shape as points3d -- improves mesh shading."
+                }),
+                "sky_mask": ("MASK", {
+                    "tooltip": "Optional sky keep-mask from SkySegmentation -- filters sky pixels out of the mesh/point cloud."
+                }),
+                "depth": ("DEPTH", {
+                    "tooltip": "Optional depth map -- enables apply_edge_mask, same mechanism as HWMSavePointCloud."
+                }),
+                "apply_edge_mask": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Remove points at depth/normal discontinuities (requires both depth and normals connected)."
+                }),
+                "edge_normal_threshold": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 90.0, "step": 0.5}),
+                "edge_depth_threshold": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 1.0, "step": 0.005}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("filepath",)
+    FUNCTION = "save"
+    CATEGORY = "HunyuanWorld-Mirror/output"
+    OUTPUT_NODE = True
+
+    def save(
+        self,
+        points3d: torch.Tensor,
+        images: torch.Tensor,
+        camera_poses: torch.Tensor,
+        filepath: str,
+        as_mesh: bool,
+        show_camera: bool,
+        normals: Optional[torch.Tensor] = None,
+        sky_mask: Optional[torch.Tensor] = None,
+        depth: Optional[torch.Tensor] = None,
+        apply_edge_mask: bool = True,
+        edge_normal_threshold: float = 5.0,
+        edge_depth_threshold: float = 0.03,
+    ) -> Tuple[str]:
+        if points3d is None:
+            print("Warning: 3D points not available - skipping composite scene export")
+            return ("",)
+
+        points_np = tensor_to_numpy(points3d)
+        if points_np.ndim == 5:
+            points_np = points_np.squeeze(0)  # [S, H, W, 3]
+
+        images_np = tensor_to_numpy(images)  # [S, H, W, 3] float [0,1]
+        poses_np = tensor_to_numpy(camera_poses)
+        if poses_np.ndim == 4 and poses_np.shape[0] == 1:
+            poses_np = poses_np[0]  # [S, 4, 4]
+
+        s, h, w = points_np.shape[:3]
+
+        normals_np = None
+        if normals is not None:
+            normals_np = tensor_to_numpy(normals)
+            if normals_np.ndim == 5:
+                normals_np = normals_np.squeeze(0)
+
+        valid_mask = np.ones((s, h, w), dtype=bool)
+
+        if sky_mask is not None:
+            sky_np = tensor_to_numpy(sky_mask).astype(bool)
+            if sky_np.shape[-2:] == (h, w):
+                valid_mask &= sky_np
+
+        if apply_edge_mask and depth is not None and normals_np is not None:
+            depth_np = tensor_to_numpy(depth)
+            if depth_np.ndim == 5:
+                depth_np = depth_np.squeeze(0)
+                if depth_np.shape[-1] == 1:
+                    depth_np = depth_np.squeeze(-1)
+            elif depth_np.ndim == 4 and depth_np.shape[-1] == 1:
+                depth_np = depth_np.squeeze(-1)
+
+            if depth_np.shape[0] == s and depth_np.shape[-2:] == (h, w):
+                for i in range(s):
+                    d_edges = depth_edge(depth_np[i], rtol=edge_depth_threshold)
+                    n_edges = normals_edge(normals_np[i], tol=edge_normal_threshold)
+                    valid_mask[i] &= ~(d_edges & n_edges)
+            else:
+                print(f"  Warning: depth shape {depth_np.shape} doesn't match points3d grid ({s},{h},{w}) -- skipping edge mask")
+
+        scene = build_composite_scene(
+            points3d=points_np,
+            images=images_np,
+            camera_poses=poses_np,
+            normals=normals_np,
+            valid_masks=valid_mask,
+            show_camera=show_camera,
+            as_mesh=as_mesh,
+        )
+
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        if not filepath.endswith(".glb"):
+            filepath = filepath.rsplit(".", 1)[0] + ".glb"
+        scene.export(filepath, file_type="glb")
+
+        return (filepath,)
+
+
+# ============================================================================
 # Node Mappings for ComfyUI Registration
 # ============================================================================
 
@@ -1554,6 +1899,9 @@ NODE_CLASS_MAPPINGS = {
     "SaveCameraParams": SaveCameraParams,
     "SaveCOLMAPReconstruction": SaveCOLMAPReconstruction,
     "View3DInBrowser": View3DInBrowser,
+    "SkySegmentation": SkySegmentation,
+    "RenderGaussianFlythrough": RenderGaussianFlythrough,
+    "SaveCompositeScene": SaveCompositeScene,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1568,6 +1916,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SaveCameraParams": "Save Camera Parameters",
     "SaveCOLMAPReconstruction": "Save COLMAP Reconstruction",
     "View3DInBrowser": "View 3D in Browser",
+    "SkySegmentation": "Sky Segmentation",
+    "RenderGaussianFlythrough": "Render Gaussian Flythrough",
+    "SaveCompositeScene": "Save Composite Scene (GLB)",
 }
 
 # Web directory for custom frontend extensions (if needed in the future)
