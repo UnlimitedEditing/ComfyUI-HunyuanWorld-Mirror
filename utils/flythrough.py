@@ -223,7 +223,7 @@ def render_gaussian_flythrough(
     if s > 1:
         all_ext, all_int = _build_interpolated_traj(camtoworlds, intrinsics, list(range(s)), interp_per_pair)
     else:
-        radius_source = splats["means"].median(dim=0).values.norm(dim=-1)[None]
+        radius_source = splats["means"][0].median(dim=0).values.norm(dim=-1)[None]
         all_ext, all_int = _build_wobble_traj(camtoworlds, intrinsics, interp_per_pair * 12, radius_source)
 
     effects = GSEffects(start_time=0.0, end_time=10.0) if apply_spread_effect else None
