@@ -194,7 +194,7 @@ def build_composite_scene(
     if not np.isfinite(scene_scale_factor) or scene_scale_factor <= 0:
         scene_scale_factor = 1.0
 
-    color_palette = __import__("matplotlib").colormaps.get_cmap("gist_rainbow")
+    color_palette = __import__("matplotlib").colormaps["gist_rainbow"]  # .get_cmap() removed in newer matplotlib
     output_scene = trimesh.Scene()
 
     if as_mesh:

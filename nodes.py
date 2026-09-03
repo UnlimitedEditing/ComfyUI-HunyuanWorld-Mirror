@@ -6,8 +6,8 @@ All 8 core nodes for 3D reconstruction from images.
 
 import torch
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from typing import Tuple, Dict, Any, Optional
 
 from .utils import (
@@ -620,7 +620,7 @@ class VisualizeDepth:
 
         # Process each depth map
         colored_images = []
-        cmap = cm.get_cmap(colormap)
+        cmap = matplotlib.colormaps[colormap]  # cm.get_cmap() removed in newer matplotlib
 
         for i in range(batch_size):
             depth_single = depth_np[i]

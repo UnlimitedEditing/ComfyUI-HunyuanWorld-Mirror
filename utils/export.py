@@ -680,8 +680,8 @@ def save_depth_visualization(
     Returns:
         filepath: Path to saved file
     """
+    import matplotlib
     import matplotlib.pyplot as plt
-    from matplotlib import cm
 
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
 
@@ -690,7 +690,7 @@ def save_depth_visualization(
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
 
     # Apply colormap
-    cmap = cm.get_cmap(colormap)
+    cmap = matplotlib.colormaps[colormap]  # cm.get_cmap() removed in newer matplotlib
     colored = cmap(depth)
 
     # Convert to RGB and save
