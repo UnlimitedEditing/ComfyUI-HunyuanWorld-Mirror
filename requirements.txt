@@ -48,5 +48,16 @@ ninja
 jaxtyping
 rich
 
+# flash-attn (OPTIONAL, installed separately if at all): models/layers/attention.py
+# (WorldMirror 2.0) falls back to PyTorch SDPA when flash-attn isn't installed --
+# functionally correct, just slower. Skip this entirely for a normal local install;
+# only relevant if you're chasing the same throughput flash-attn gives on a
+# Graydient-style deployment target. See UnlimitedEditing/flash-attention and
+# KI-007 for a custom-built wheel matching a specific py3.12/torch2.11/cu128
+# environment -- same reasoning as the gsplat wheel above, install from the
+# matching prebuilt wheel or the official repo, don't add a bare "flash-attn"
+# line here (it source-compiles, needing the CUDA toolkit -- same class of
+# multi-hour build problem gsplat has).
+
 # Optional: OpenEXR for depth export (may require system libraries)
 # OpenEXR-Python>=1.3.0  # Uncomment if needed
