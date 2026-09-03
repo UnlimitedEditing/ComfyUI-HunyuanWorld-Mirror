@@ -6,10 +6,12 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from src.models.layers import PatchEmbed, PatchEmbed_Mlp
-from src.models.layers.block import Block
-from src.models.layers.rope import RotaryPositionEmbedding2D, PositionGetter
-from src.models.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from ..layers import PatchEmbed, PatchEmbed_Mlp
+from ..layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from ..layers.block import Block, DistBlock
+from ...comm.padding import minimal_pad_to_divisible,depad_by_length,pad_by_length
+import torch.distributed as dist
+from ...comm.communication import _All2All,_Allgather
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,11 @@ class VisualGeometryTransformer(nn.Module):
         patch_embed (str): Type of patch embed. e.g., "conv" or "dinov2_vitl14_reg".
         aa_order (list[str]): The order of alternating attention, e.g. ["frame", "global"].
         qk_norm (bool): Whether to apply QK normalization.
-        rope_freq (int): Base frequency for rotary embedding. -1 to disable.
+        rope_base (int): Base frequency for rotary embedding.
+        rope_normalize_coords (str): Normalize coordinates for rotary embedding.
+        rope_shift_coords (float): Shift coordinates for rotary embedding.
+        rope_jitter_coords (float): Jitter coordinates for rotary embedding.
+        rope_rescale_coords (float): Rescale coordinates for rotary embedding.
         init_values (float): Init scale for layer scale.
         enable_condition (bool): Whether to enable conditioning inputs.
         sampling_strategy (str): Sampling strategy for patches.
@@ -60,7 +66,12 @@ class VisualGeometryTransformer(nn.Module):
         ffn_bias=True,
         patch_embed="dinov2_vitl14_reg",
         qk_norm=True,
-        rope_freq=100,
+        rope_base=100.0,
+        normalized_rope=False,
+        rope_normalize_coords="separate",
+        rope_shift_coords=None,
+        rope_jitter_coords=None,
+        rope_rescale_coords=None,
         init_values=0.01,
         enable_cond=False,
         sampling_strategy="uniform",
@@ -88,7 +99,7 @@ class VisualGeometryTransformer(nn.Module):
             self._init_cond_embeddings(embed_dim, img_size, patch_size, num_register_tokens)
             
         # Initialize rotary position embedding
-        self._init_rotary_position_embedding(rope_freq)
+        self._init_rotary_position_embedding(rope_base, normalized_rope, embed_dim // num_heads, rope_normalize_coords, rope_shift_coords, rope_jitter_coords, rope_rescale_coords)
         
         # Initialize transformer blocks
         self._init_transformer_blocks(block_fn, embed_dim, num_heads, mlp_ratio, qkv_bias, proj_bias, ffn_bias, init_values, qk_norm)
@@ -203,11 +214,28 @@ class VisualGeometryTransformer(nn.Module):
         else:
             raise NotImplementedError
 
-    def _init_rotary_position_embedding(self, rope_freq):
-        self.rope = RotaryPositionEmbedding2D(
-            frequency=rope_freq, 
-        ) if rope_freq > 0 else None
-        self.pos_getter = PositionGetter() if self.rope is not None else None
+    def _init_rotary_position_embedding(self, rope_base, normalized_rope, head_dim, rope_normalize_coords, rope_shift_coords, rope_jitter_coords, rope_rescale_coords):
+        if normalized_rope:
+            print("[INFO] Using normalized RoPE!")
+            from ..layers.norm_rope import NormalizedRotaryPositionEmbedding2D, PositionGetter
+            if head_dim % 4 != 0:
+                raise ValueError("RoPE requires head_dim divisible by 4 (embed_dim must be divisible by 4*num_heads)")
+            self.rope = NormalizedRotaryPositionEmbedding2D(
+                head_dim=head_dim,
+                base=rope_base,
+                normalize_coords=rope_normalize_coords,
+                shift_coords=rope_shift_coords,
+                jitter_coords=rope_jitter_coords,
+                rescale_coords=rope_rescale_coords,
+            ) if rope_base > 0 else None
+            self.pos_getter = PositionGetter() if self.rope is not None else None
+        else:
+            from ..layers.rope import RotaryPositionEmbedding2D, PositionGetter
+            print("[INFO] Using standard RoPE!")
+            self.rope = RotaryPositionEmbedding2D(
+                frequency=rope_base, 
+            ) if rope_base > 0 else None
+            self.pos_getter = PositionGetter() if self.rope is not None else None
 
     def _init_transformer_blocks(self, block_fn, embed_dim, num_heads, mlp_ratio, qkv_bias, proj_bias, ffn_bias, init_values, qk_norm):
         self.frame_blocks = nn.ModuleList([
@@ -247,7 +275,7 @@ class VisualGeometryTransformer(nn.Module):
         nn.init.normal_(self.cam_token, std=1e-6)
         nn.init.normal_(self.reg_token, std=1e-6)
 
-    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None, enable_bf16=False, sp_size: int=1, sp_group: torch._C._distributed_c10d.ProcessGroup=None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images: Input images with shape [B, S, 3, H, W], in range [0, 1]
@@ -272,7 +300,7 @@ class VisualGeometryTransformer(nn.Module):
         if ch != 3:
             raise ValueError(f"Expected 3 input channels, got {ch}")
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):           
+        with torch.amp.autocast('cuda', enabled=(not enable_bf16), dtype=torch.bfloat16): 
             images = (images - self._resnet_mean) / self._resnet_std
             images = images.reshape(b * seq_len, ch, h, w)
             patch_tokens = self.patch_embed(images)
@@ -304,35 +332,94 @@ class VisualGeometryTransformer(nn.Module):
                 pos_emb = pos_emb + 1
                 special_pos = torch.zeros(b * seq_len, self.patch_start_idx, 2, device=images.device, dtype=pos_emb.dtype)
                 pos_emb = torch.cat([special_pos, pos_emb], dim=1)
-
+        
+        if sp_size>1:
+            rank_in_sp_group = dist.get_group_rank(sp_group,dist.get_rank())
+            all_tokens,tk_padding_len = minimal_pad_to_divisible(all_tokens, sp_size, dim=1,pad_value=0)
+            all_tokens = torch.chunk(all_tokens, sp_size,dim=1)[rank_in_sp_group]
+        
+        _, patch_count, embed_dim = all_tokens.shape
+        token_shape = (b, seq_len, patch_count, embed_dim)
         # Forward through attention blocks
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):            
+        with torch.amp.autocast('cuda', enabled=(not enable_bf16), dtype=torch.bfloat16):            
             outputs = []
             global_tokens = None
-            for idx in range(self.depth):
-                local_tokens = self._process_attention_blocks(
-                            tokens=all_tokens if global_tokens is None else global_tokens,
-                            b=b,
-                            seq_len=seq_len,
-                            patch_count=patch_count,
-                            embed_dim=embed_dim,
-                            block_idx=idx,
-                            blocks=self.frame_blocks,
-                            block_type='frame',
-                            pos=pos_emb,
-                        )
-                global_tokens = self._process_attention_blocks(
-                            tokens=local_tokens,
-                            b=b,
-                            seq_len=seq_len,
-                            patch_count=patch_count,
-                            embed_dim=embed_dim,
-                            block_idx=idx,
-                            blocks=self.global_blocks,
-                            block_type='global',
-                            pos=pos_emb,
-                        )
-
+            if sp_size>1:
+                for idx in range(self.depth):
+                    local_tokens = self._process_dist_attention_blocks(
+                                tokens=all_tokens if global_tokens is None else global_tokens,
+                                b=b,
+                                seq_len=seq_len,
+                                patch_count=patch_count,
+                                embed_dim=embed_dim,
+                                block_idx=idx,
+                                blocks=self.frame_blocks,
+                                block_type='frame',
+                                pos=pos_emb,
+                                sp_size = sp_size,
+                                sp_group = sp_group,
+                                padding_tokens = tk_padding_len
+                            )
+                    global_tokens = self._process_dist_attention_blocks(
+                                tokens=local_tokens,
+                                b=b,
+                                seq_len=seq_len,
+                                patch_count=patch_count,
+                                embed_dim=embed_dim,
+                                block_idx=idx,
+                                blocks=self.global_blocks,
+                                block_type='global',
+                                pos=pos_emb,
+                                sp_size = sp_size,
+                                sp_group = sp_group,
+                                padding_tokens = tk_padding_len
+                            )
+                    global_tokens = global_tokens.reshape(b,-1,embed_dim)
+                    global_tokens = _Allgather.apply(global_tokens,1,sp_group,False)
+                    global_tokens = depad_by_length(global_tokens,tk_padding_len*seq_len,1)
+                    global_tokens = global_tokens.reshape(b,seq_len,-1,embed_dim)
+                    global_tokens = pad_by_length(global_tokens,tk_padding_len,2)
+                    global_tokens = torch.chunk(global_tokens, sp_size,dim=2)[rank_in_sp_group]
+                    
+                    # Combine frame and global intermediates
+                    if idx in self.intermediate_idxs:
+                        local_tokens = _Allgather.apply(local_tokens,2,sp_group,False)
+                        local_tokens = depad_by_length(local_tokens,tk_padding_len,2)
+                        global_tokens = _Allgather.apply(global_tokens,2,sp_group,False)
+                        global_tokens = depad_by_length(global_tokens,tk_padding_len,2)
+                        combined_out = torch.cat([local_tokens, global_tokens], dim=-1)
+                        outputs.append(combined_out)
+                        global_tokens = pad_by_length(global_tokens,tk_padding_len,2)
+                        global_tokens = torch.chunk(global_tokens, sp_size,dim=2)[rank_in_sp_group]
+            else:
+                for idx in range(self.depth):
+                    local_tokens = self._process_attention_blocks(
+                                tokens=all_tokens if global_tokens is None else global_tokens,
+                                b=b,
+                                seq_len=seq_len,
+                                patch_count=patch_count,
+                                embed_dim=embed_dim,
+                                block_idx=idx,
+                                blocks=self.frame_blocks,
+                                block_type='frame',
+                                pos=pos_emb,
+                            )
+                    global_tokens = self._process_attention_blocks(
+                                tokens=local_tokens,
+                                b=b,
+                                seq_len=seq_len,
+                                patch_count=patch_count,
+                                embed_dim=embed_dim,
+                                block_idx=idx,
+                                blocks=self.global_blocks,
+                                block_type='global',
+                                pos=pos_emb,
+                            )
+                    # Combine frame and global intermediates
+                    if idx in self.intermediate_idxs:
+                        combined_out = torch.cat([local_tokens, global_tokens], dim=-1)
+                        outputs.append(combined_out)
+                    
                 # Combine frame and global intermediates
                 if idx in self.intermediate_idxs:
                     combined_out = torch.cat([local_tokens, global_tokens], dim=-1)
@@ -387,11 +474,50 @@ class VisualGeometryTransformer(nn.Module):
             pos = pos.reshape(*pos_target_shape)
         
         if self.training:
+            # tokens = blocks[block_idx](tokens, pos=pos)
             tokens = checkpoint(blocks[block_idx], tokens, pos=pos, use_reentrant=self.use_reentrant)
         else:
             tokens = blocks[block_idx](tokens, pos=pos)
             
         return tokens.reshape(*token_shape)
+
+    def _process_dist_attention_blocks(self, tokens, b, seq_len, patch_count, embed_dim, block_idx, blocks, block_type, pos=None,
+                                sp_size = 1,
+                                sp_group = None,
+                                padding_tokens = 0):
+        """Process attention blocks with tokens in shape (B*S, P, C)."""
+        token_shape = (b, seq_len, patch_count, embed_dim)
+        if block_type == 'frame': # local
+            target_shape = (b * seq_len, patch_count, embed_dim)
+            pos_target_shape = (b * seq_len, patch_count*sp_size-padding_tokens, 2) if pos is not None else None
+        else:  # global
+            target_shape = (b, seq_len * patch_count, embed_dim)
+            pos_target_shape = (b, seq_len * (patch_count*sp_size-padding_tokens), 2) if pos is not None else None
+            # padding_tokens = padding_tokens*seq_len
+        
+        if block_type=="global":
+            rank_in_sp_group = dist.get_group_rank(sp_group,dist.get_rank())
+            tokens = _Allgather.apply(tokens,2,sp_group,False) #(1,7,4*146,64)
+            tokens = depad_by_length(tokens,padding_tokens,2) #(1,7,4*146-2,64)
+            tokens = tokens.reshape(b,-1,embed_dim) #(1,7*(4*146-2),64)
+            padding_tokens = padding_tokens*seq_len
+            tokens = pad_by_length(tokens,padding_tokens,1) #(1,4088,1024)
+            tokens = torch.chunk(tokens, sp_size,dim=1)[rank_in_sp_group]
+            
+        if tokens.shape != target_shape:
+            tokens = tokens.reshape(*target_shape)
+        
+        if pos is not None and pos.shape != pos_target_shape: 
+            pos = pos.reshape(*pos_target_shape)
+        
+        if self.training:
+            # tokens = blocks[block_idx](tokens, pos=pos)
+            tokens = checkpoint(blocks[block_idx], tokens, pos=pos, use_reentrant=self.use_reentrant, sp_size=sp_size, sp_group=sp_group, padding_tokens=padding_tokens, block_type =block_type,token_shape=token_shape)
+        else:
+            tokens = blocks[block_idx](tokens, pos=pos, sp_size=sp_size, sp_group=sp_group, padding_tokens=padding_tokens, block_type =block_type,token_shape=token_shape)
+            
+        return tokens.reshape(*token_shape)
+
 
 
 def expand_and_flatten_special_tokens(token_tensor, b, seq_len):

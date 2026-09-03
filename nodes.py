@@ -193,9 +193,14 @@ class LoadHunyuanWorldMirrorModel:
         return {
             "required": {
                 "model_name": ("STRING", {
-                    "default": "HunyuanWorld-Mirror",
+                    "default": "tencent/HY-World-2.0",
                     "multiline": False,
-                    "tooltip": "Model name, filename, or path. Checks ComfyUI/models/HunyuanWorld-Mirror/ first. Examples: 'HunyuanWorld-Mirror', 'model.safetensors', or full path."
+                    "tooltip": "WorldMirror 2.0 checkpoint: a HuggingFace repo id (files expected under {repo}/{subfolder}/) or a local path. Checks ComfyUI/models/HunyuanWorld-Mirror/{subfolder}/ first (concept_mapping pre-staging), then falls back to a live HF Hub download. Default is Tencent's official multi-model HY-World-2.0 repo -- switched from the legacy standalone tencent/HunyuanWorld-Mirror repo, which the model zoo now marks legacy."
+                }),
+                "subfolder": ("STRING", {
+                    "default": "HY-WorldMirror-2.0",
+                    "multiline": False,
+                    "tooltip": "Subfolder inside model_name's repo/path holding config.json + model.safetensors. Matches HY-World-2.0's own multi-model repo layout (HY-Pano-2.0 and WorldMirror-2.0 live side by side in the same repo)."
                 }),
                 "device": (["auto", "cuda", "cpu"], {
                     "default": "auto",
@@ -227,6 +232,7 @@ class LoadHunyuanWorldMirrorModel:
     def load_model(
         self,
         model_name: str,
+        subfolder: str,
         device: str,
         precision: str,
         force_reload: bool,
@@ -235,13 +241,14 @@ class LoadHunyuanWorldMirrorModel:
         """Load and cache the model."""
 
         print("=" * 60)
-        print("Loading HunyuanWorld-Mirror Model")
+        print("Loading WorldMirror 2.0")
         print("=" * 60)
 
         try:
             # Load model (with optional cache bypass)
             model, cache_key = load_model(
                 model_name=model_name,
+                subfolder=subfolder,
                 device=device,
                 precision=precision,
                 cache_dir=cache_dir if cache_dir else None,

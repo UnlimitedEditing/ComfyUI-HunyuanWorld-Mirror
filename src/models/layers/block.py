@@ -7,7 +7,7 @@ from typing import Callable, List, Any, Tuple, Dict
 import torch
 from torch import nn, Tensor
 
-from .attention import Attention
+from .attention import Attention, DistAttention
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
@@ -89,6 +89,33 @@ class Block(nn.Module):
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
             x = x + attn_residual_func(x, pos=pos)
+            x = x + ffn_residual_func(x)
+        return x
+
+class DistBlock(Block):
+    def __init__(self, *args, attn_class: Callable[..., nn.Module] = DistAttention, **kwargs):
+        super().__init__(*args, attn_class=attn_class, **kwargs)
+
+    def forward(self, x: Tensor, pos=None, sp_size=1,sp_group=None,padding_tokens=0,block_type = None, token_shape=None) -> Tensor:
+        def attn_residual_func(x: Tensor, pos=None, sp_size=1,sp_group=None,padding_tokens=0) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), pos=pos,sp_size=sp_size,sp_group=sp_group,padding_tokens=padding_tokens))
+
+        def ffn_residual_func(x: Tensor) -> Tensor:
+            return self.ls2(self.mlp(self.norm2(x)))
+
+        if self.training and self.sample_drop_ratio > 0.1:
+            # the overhead is compensated only for a drop path rate larger than 0.1
+            x = drop_add_residual_stochastic_depth(
+                x, pos=pos, sp_size=sp_size,sp_group=sp_group,padding_tokens=padding_tokens,residual_func=attn_residual_func, sample_drop_ratio=self.sample_drop_ratio
+            )
+            x = drop_add_residual_stochastic_depth(
+                x, residual_func=ffn_residual_func, sample_drop_ratio=self.sample_drop_ratio
+            )
+        elif self.training and self.sample_drop_ratio > 0.0:
+            x = x + self.drop_path1(attn_residual_func(x, pos=pos,sp_size=sp_size,sp_group=sp_group,padding_tokens=padding_tokens))
+            x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
+        else:
+            x = x + attn_residual_func(x, pos=pos,sp_size=sp_size,sp_group=sp_group,padding_tokens=padding_tokens)
             x = x + ffn_residual_func(x)
         return x
 

@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.layers import Mlp
-from src.models.layers.block import Block
+from ..layers import Mlp, MlpFP32
+from ..layers.block import Block, DistBlock
 
 
 class CameraHead(nn.Module):
@@ -23,6 +23,7 @@ class CameraHead(nn.Module):
         trans_act: str = "linear",
         quat_act: str = "linear",
         fl_act: str = "relu",
+        block_fn: nn.Module = Block,
     ):
         super().__init__()
 
@@ -35,7 +36,7 @@ class CameraHead(nn.Module):
         # Build refinement network using transformer block sequence
         self.refine_net = nn.Sequential(
             *[
-                Block(dim=dim_in, num_heads=num_heads, mlp_ratio=mlp_ratio, init_values=init_values)
+                block_fn(dim=dim_in, num_heads=num_heads, mlp_ratio=mlp_ratio, init_values=init_values)
                 for _ in range(trunk_depth)
             ]
         )
@@ -53,7 +54,23 @@ class CameraHead(nn.Module):
 
         # Adaptive layer normalization (no learnable parameters)
         self.adapt_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
-        self.param_predictor = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.out_dim, drop=0)
+        # self.param_predictor = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.out_dim, drop=0)
+        self.param_predictor = MlpFP32(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.out_dim, drop=0)
+
+    def to(self, *args, **kwargs):
+        self.refine_net = self.refine_net.to(*args, **kwargs)
+        self.token_norm = self.token_norm.to(*args, **kwargs)
+        self.out_norm = self.out_norm.to(*args, **kwargs)
+        self.adapt_norm_gen = self.adapt_norm_gen.to(*args, **kwargs)
+        self.adapt_norm = self.adapt_norm.to(*args, **kwargs)
+        self.param_predictor = self.param_predictor.to(*args, **kwargs)
+
+        # keep these parameters in FP32
+        args, kwargs = MlpFP32.map_to_args_to_float(args, kwargs)
+        self.init_token = nn.Parameter(self.init_token.to(*args, **kwargs))
+        self.param_embed = self.param_embed.to(*args, **kwargs)
+
+        return self
 
     def forward(self, feat_seq: list, steps: int = 4) -> list:
         """
@@ -85,6 +102,7 @@ class CameraHead(nn.Module):
             else:
                 curr_pred = curr_pred.detach()
                 net_input = self.param_embed(curr_pred)
+            net_input = net_input.to(cam_tokens.dtype)
             norm_shift, norm_scale, norm_gate = self.adapt_norm_gen(net_input).chunk(3, dim=-1)
             mod_cam_feat = norm_gate * self.apply_adaptive_modulation(self.adapt_norm(cam_tokens), norm_shift, norm_scale)
             mod_cam_feat = mod_cam_feat + cam_tokens

@@ -13,7 +13,6 @@ from torch.utils.checkpoint import checkpoint
 from torch.nn.init import trunc_normal_
 from . import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
 
-# Use standard Python logging instead of training-specific logger
 log = logging.getLogger(__name__)
 
 
@@ -226,6 +225,7 @@ class DinoVisionTransformer(nn.Module):
 
         for blk in self.blocks:
             if self.training:
+                # x = blk(x)
                 x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
             else:
                 x = blk(x)
@@ -253,6 +253,7 @@ class DinoVisionTransformer(nn.Module):
 
         for blk in self.blocks:
             if self.training:
+                # x = blk(x)
                 x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
             else:
                 x = blk(x)

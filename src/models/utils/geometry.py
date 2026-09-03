@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+from typing import Tuple
 
 def depth_to_camera_coords(depthmap, camera_intrinsics):
     """
@@ -109,30 +109,3 @@ def closed_form_inverse_se3(se3: torch.Tensor) -> torch.Tensor:
     out[:, :3, 3] = t_inv
     out[:, 3, 3] = 1.0
     return out
-
-
-def create_pixel_coordinate_grid(num_frames, height, width):
-    """
-    Creates a grid of pixel coordinates and frame indices for all frames.
-    Returns:
-        tuple: A tuple containing:
-            - points_xyf (numpy.ndarray): Array of shape (num_frames, height, width, 3)
-                                            with x, y coordinates and frame indices
-    """
-    # Create coordinate grids for a single frame
-    y_grid, x_grid = np.indices((height, width), dtype=np.float32)
-    x_grid = x_grid[np.newaxis, :, :]
-    y_grid = y_grid[np.newaxis, :, :]
-
-    # Broadcast to all frames
-    x_coords = np.broadcast_to(x_grid, (num_frames, height, width))
-    y_coords = np.broadcast_to(y_grid, (num_frames, height, width))
-
-    # Create frame indices and broadcast
-    f_idx = np.arange(num_frames, dtype=np.float32)[:, np.newaxis, np.newaxis]
-    f_coords = np.broadcast_to(f_idx, (num_frames, height, width))
-
-    # Stack coordinates and frame indices
-    points_xyf = np.stack((x_coords, y_coords, f_coords), axis=-1)
-
-    return points_xyf

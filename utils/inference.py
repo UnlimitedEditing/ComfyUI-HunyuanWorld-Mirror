@@ -170,62 +170,66 @@ class InferenceWrapper:
 
 
 def load_model(
-    model_name: str = "tencent/HunyuanWorld-Mirror",
+    model_name: str = "tencent/HY-World-2.0",
     device: str = "auto",
     precision: str = "fp32",
     cache_dir: Optional[str] = None,
-    use_cache: bool = True
+    use_cache: bool = True,
+    subfolder: str = "HY-WorldMirror-2.0",
 ) -> Tuple[Any, str]:
     """
-    Load HunyuanWorld-Mirror model with caching.
+    Load WorldMirror 2.0 with caching.
+
+    CONFIRMED LIVE (2026-09-03): swapped from WorldMirror 1.0 (raw safetensors
+    state_dict + a from-scratch "just call WorldMirror()" instantiation, which
+    silently used constructor DEFAULTS rather than the checkpoint's own config
+    -- v1's defaults happened to be close enough to work, but WorldMirror 2.0's
+    config.json sets fixed_patch_embed=true against a constructor default of
+    False, plus several new kwargs (enable_depth_mask, condition_strategy)
+    that don't exist on v1 at all. Bare `WorldMirror()` would silently build
+    the WRONG architecture and either fail to load the state dict or load it
+    onto mismatched layers. This loader instead follows Tencent's own
+    HY-World-2.0 reference implementation (hyworld2/worldrecon/pipeline.py,
+    WorldMirrorPipeline.from_pretrained) exactly: resolve a directory holding
+    config.json + model.safetensors, build WorldMirror(**config), then load
+    weights with a selective (shape-checked) state dict merge rather than a
+    strict load.
 
     Args:
-        model_name: Model identifier, path, or filename
+        model_name: HuggingFace repo id or local path. Model files are
+            expected under {model_name}/{subfolder}/ (matching HY-World-2.0's
+            own multi-model repo layout), OR directly in {model_name} if it
+            already contains config.json + model.safetensors (local
+            concept_mapping staging, or a bare v2 checkpoint dir).
         device: Target device ('auto', 'cuda', 'cpu')
         precision: Precision mode ('fp32', 'fp16', 'bf16')
-        cache_dir: Custom cache directory for model files
+        cache_dir: Custom cache directory for HuggingFace downloads
         use_cache: Whether to use model cache
+        subfolder: Subfolder inside the repo holding the WorldMirror
+            checkpoint. Default matches HY-World-2.0's own repo layout.
 
     Returns:
         Tuple of (model, cache_key)
     """
-    # Determine device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Resolve model path
-    model_path = _resolve_model_path(model_name)
+    model_dir = _resolve_wm2_model_dir(model_name, subfolder, cache_dir)
+    cache_key = f"{model_dir}_{device}_{precision}"
 
-    # Create cache key based on actual path
-    cache_key = f"{model_path}_{device}_{precision}"
-
-    # Check cache
     if use_cache:
         cached_model = ModelCache.get(cache_key)
         if cached_model is not None:
-            print(f"✓ Model loaded from cache: {os.path.basename(model_path)}")
+            print(f"✓ Model loaded from cache: {model_dir}")
             return cached_model, cache_key
 
-    # Load model
-    print(f"Loading HunyuanWorld-Mirror model from: {model_path}")
+    print(f"Loading WorldMirror 2.0 from: {model_dir}")
     print(f"Device: {device}, Precision: {precision}")
 
     try:
-        # Load based on file type
-        if model_path.endswith('.safetensors'):
-            model = _load_safetensors_model(model_path, device, precision)
-        elif model_path.endswith('.pt') or model_path.endswith('.pth'):
-            model = _load_pytorch_model(model_path, device, precision)
-        elif os.path.isdir(model_path):
-            model = _load_from_directory(model_path, device, precision, cache_dir)
-        else:
-            # Try HuggingFace Hub
-            model = _load_from_hub(model_name, device, precision, cache_dir)
-
-        # Set to eval mode
+        model = _load_worldmirror2(model_dir, device, precision)
         model.eval()
 
-        # Cache the model
         if use_cache:
             ModelCache.set(cache_key, model)
 
@@ -239,290 +243,134 @@ def load_model(
         raise
 
 
-def _resolve_model_path(model_name: str) -> str:
-    """
-    Resolve model name to actual file path.
+def _has_model_files(path: str) -> bool:
+    """A directory holds a real WorldMirror 2.0 checkpoint if it has both
+    model.safetensors and a config (config.json, matching HY-World-2.0's own
+    HF repo; config.yaml also accepted for parity with the upstream loader,
+    though HY-World-2.0's own HF repo only ships config.json)."""
+    has_weights = os.path.isfile(os.path.join(path, "model.safetensors"))
+    has_config = (os.path.isfile(os.path.join(path, "config.yaml"))
+                  or os.path.isfile(os.path.join(path, "config.json")))
+    return has_weights and has_config
 
-    Checks in order:
-    1. Direct path (if exists)
-    2. ComfyUI/models/HunyuanWorld-Mirror/{model_name}
-    3. ComfyUI/models/HunyuanWorld-Mirror/HunyuanWorld-Mirror.safetensors
-    4. Returns model_name as-is (for HuggingFace Hub)
-    """
-    # If it's already a valid path, use it
-    if os.path.exists(model_name):
-        return os.path.abspath(model_name)
 
-    # Try to find ComfyUI models directory
-    # Work backwards from this file's location
+def _resolve_wm2_model_dir(model_name: str, subfolder: str, cache_dir: Optional[str]) -> str:
+    """
+    Resolve model_name to a local directory containing config.json + model.safetensors.
+
+    Resolution order (matching Tencent's own _resolve_model_dir in
+    hyworld2/worldrecon/pipeline.py, plus a local-ComfyUI-models candidate
+    first so concept_mapping pre-staging is honored):
+      1. {ComfyUI}/models/HunyuanWorld-Mirror/{subfolder}/ -- concept_mapping's
+         pre-staged destination, checked first so a job with a pre-downloaded
+         checkpoint never touches the network.
+      2. {model_name}/{subfolder} -- local repo root with subfolder (or
+         model_name itself, if it's already a real local directory).
+      3. {model_name} directly, if it already holds config+weights (bare
+         local checkpoint dir, no subfolder nesting).
+      4. HuggingFace Hub download via snapshot_download(repo_id=model_name,
+         allow_patterns=[f"{subfolder}/*"]) -- best-effort self-heal if
+         concept_mapping's pre-stage isn't present on this job (confirmed
+         platform limitation: concept_mapping isn't guaranteed across
+         Graydient machine classes).
+    """
     current_dir = Path(__file__).parent.parent  # ComfyUI-HunyuanWorld-Mirror directory
-
-    # Look for ComfyUI root (should be parent of custom_nodes)
     if current_dir.parent.name == "custom_nodes":
         comfy_root = current_dir.parent.parent
-        models_dir = comfy_root / "models" / "HunyuanWorld-Mirror"
+        local_candidate = comfy_root / "models" / "HunyuanWorld-Mirror" / subfolder
+        if local_candidate.is_dir() and _has_model_files(str(local_candidate)):
+            print(f"[Init] Found local model at {local_candidate}")
+            return str(local_candidate)
 
-        # Check various possible locations
-        candidates = [
-            models_dir / model_name,
-            models_dir / f"{model_name}.safetensors",
-            models_dir / "HunyuanWorld-Mirror.safetensors",
-        ]
+    candidate = os.path.join(model_name, subfolder)
+    if os.path.isdir(candidate) and _has_model_files(candidate):
+        print(f"[Init] Found local model at {candidate}")
+        return candidate
 
-        for candidate in candidates:
-            if candidate.exists():
-                print(f"Found model at: {candidate}")
-                return str(candidate)
+    if os.path.isdir(model_name) and _has_model_files(model_name):
+        print(f"[Init] Found local model at {model_name}")
+        return model_name
 
-    # Return as-is for HuggingFace Hub
-    return model_name
-
-
-def _load_safetensors_model(model_path: str, device: str, precision: str) -> Any:
-    """Load model from safetensors file."""
-    from safetensors.torch import load_file
-
-    print(f"Loading from safetensors: {os.path.basename(model_path)}")
-
-    # Load state dict
-    state_dict = load_file(model_path)
-
-    # Try to import model class
-    try:
-        # Use a context manager to temporarily ensure our directory is first in sys.path
-        # This is cleaner than fighting with sys.path globally
-        import contextlib
-
-        @contextlib.contextmanager
-        def _ensure_path_priority():
-            """Temporarily ensure custom node dir is first in sys.path and clear import cache."""
-            _node_str = str(_custom_node_dir)
-
-            # Save original sys.path
-            original_path = sys.path.copy()
-
-            # Clear any cached failed imports of 'src' modules
-            # Python caches failed imports, so we need to remove them
-            modules_to_remove = [key for key in sys.modules.keys() if key.startswith('src.')]
-            for key in modules_to_remove:
-                del sys.modules[key]
-
-            # Also remove the top-level 'src' if it exists
-            if 'src' in sys.modules:
-                del sys.modules['src']
-
-            # Remove any existing instances of our path
-            while _node_str in sys.path:
-                sys.path.remove(_node_str)
-
-            # Insert at position 0
-            sys.path.insert(0, _node_str)
-
-            print(f"[DEBUG] sys.path[0] = {sys.path[0]}")
-            print(f"[DEBUG] Cleared {len(modules_to_remove)} cached 'src.*' modules")
-
-            try:
-                yield
-            finally:
-                # Restore original sys.path
-                sys.path[:] = original_path
-
-        print(f"\n[DEBUG] Loading WorldMirror with path priority...")
-        print(f"  Custom node dir: {_custom_node_dir}")
-        print(f"  src dir exists: {(_custom_node_dir / 'src').exists()}")
-
-        # Import with our directory guaranteed to be first
-        with _ensure_path_priority():
-            from src.models.models.worldmirror import WorldMirror
-
-        print(f"[DEBUG] Successfully imported WorldMirror class!")
-
-        # Create model instance and load weights
-        model = WorldMirror()
-        model.load_state_dict(state_dict)
-
-        print(f"✓ Successfully loaded WorldMirror model from {os.path.basename(model_path)}")
-
-    except Exception as e:
-        # Fallback: Create a simple wrapper that holds the state dict
-        print(f"\n{'='*70}")
-        print(f"ERROR: Failed to load WorldMirror model class")
-        print(f"{'='*70}")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Error message: {e}")
-        print(f"\nFull traceback:")
-        import traceback
-        traceback.print_exc()
-        print(f"{'='*70}\n")
-        print("Creating fallback wrapper (inference will fail)...")
-
-        class SafetensorsModelWrapper:
-            """Simple wrapper for loaded safetensors weights."""
-            _error_shown = False  # Class variable to track if error was already shown
-
-            def __init__(self, state_dict, device, precision):
-                self.state_dict = state_dict
-                self._device = torch.device(device)
-                self._precision = precision
-
-                # Create a dummy parameter to satisfy parameters() calls
-                if precision == "fp16":
-                    dtype = torch.float16
-                elif precision == "bf16":
-                    dtype = torch.bfloat16
-                else:
-                    dtype = torch.float32
-
-                self._dummy_param = torch.zeros(1, dtype=dtype, device=self._device)
-
-            @property
-            def device(self):
-                return self._device
-
-            @device.setter
-            def device(self, value):
-                self._device = torch.device(value) if isinstance(value, str) else value
-
-            def parameters(self):
-                """Return iterator of dummy parameter for compatibility."""
-                return iter([self._dummy_param])
-
-            def eval(self):
-                return self
-
-            def to(self, device):
-                self._device = torch.device(device) if isinstance(device, str) else device
-                self._dummy_param = self._dummy_param.to(device)
-                return self
-
-            def half(self):
-                self._precision = "fp16"
-                self._dummy_param = self._dummy_param.half()
-                return self
-
-            def bfloat16(self):
-                self._precision = "bf16"
-                self._dummy_param = self._dummy_param.bfloat16()
-                return self
-
-            def __call__(self, *args, **kwargs):
-                # Only show the detailed error message once
-                if not SafetensorsModelWrapper._error_shown:
-                    SafetensorsModelWrapper._error_shown = True
-                    error_msg = (
-                        "\n" + "="*70 + "\n"
-                        "ERROR: HunyuanWorld-Mirror model architecture not found!\n"
-                        "="*70 + "\n\n"
-                        "The .safetensors file contains only model weights, not the code.\n"
-                        "SOLUTION: Enable 'force_reload' checkbox in the LoadHunyuanWorldMirrorModel node.\n\n"
-                        "If that doesn't work:\n"
-                        "1. Close ComfyUI completely\n"
-                        "2. Delete the __pycache__ folders in the custom node directory\n"
-                        "3. Restart ComfyUI\n"
-                        "4. Enable 'force_reload' and load the model again\n"
-                        + "="*70 + "\n"
-                    )
-                    print(error_msg)
-
-                # Raise a silent error (message already printed above)
-                raise NotImplementedError("Model architecture not available - see error above")
-
-        model = SafetensorsModelWrapper(state_dict, device, precision)
-
-    # Move to device
-    if hasattr(model, 'to'):
-        model = model.to(device)
-
-    # Set precision
-    if precision == "fp16" and hasattr(model, 'half'):
-        model = model.half()
-    elif precision == "bf16" and hasattr(model, 'bfloat16'):
-        model = model.bfloat16()
-
-    return model
-
-
-def _load_pytorch_model(model_path: str, device: str, precision: str) -> Any:
-    """Load model from PyTorch checkpoint file."""
-    print(f"Loading from PyTorch checkpoint: {os.path.basename(model_path)}")
-
-    checkpoint = torch.load(model_path, map_location=device)
-
-    # Try to import model class
-    try:
-        from src.models.models.worldmirror import WorldMirror
-        model = WorldMirror()
-
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict):
-            if 'model' in checkpoint:
-                model.load_state_dict(checkpoint['model'])
-            elif 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
-            else:
-                model.load_state_dict(checkpoint)
-        else:
-            model = checkpoint
-
-    except ImportError:
-        raise ImportError(
-            "WorldMirror class not found. Please install:\n"
-            "https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror"
-        )
-
-    model = model.to(device)
-
-    if precision == "fp16":
-        model = model.half()
-    elif precision == "bf16":
-        model = model.bfloat16()
-
-    return model
-
-
-def _load_from_directory(model_path: str, device: str, precision: str, cache_dir: Optional[str]) -> Any:
-    """Load model from directory (HuggingFace format)."""
-    print(f"Loading from directory: {model_path}")
-
-    try:
-        from src.models.models.worldmirror import WorldMirror
-        model = WorldMirror.from_pretrained(model_path)
-    except ImportError:
-        raise ImportError(
-            "WorldMirror class not found. Please install:\n"
-            "https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror"
-        )
-
-    model = model.to(device)
-
-    if precision == "fp16":
-        model = model.half()
-    elif precision == "bf16":
-        model = model.bfloat16()
-
-    return model
-
-
-def _load_from_hub(model_name: str, device: str, precision: str, cache_dir: Optional[str]) -> Any:
-    """Load model from HuggingFace Hub."""
-    print(f"Loading from HuggingFace Hub: {model_name}")
-
-    # Set cache directory if provided
+    print(f"[Init] Downloading from HuggingFace: {model_name} (subfolder={subfolder})")
     if cache_dir:
         os.environ['HF_HOME'] = cache_dir
-        os.environ['TRANSFORMERS_CACHE'] = cache_dir
-
-    try:
-        from src.models.models.worldmirror import WorldMirror
-        model = WorldMirror.from_pretrained(model_name)
-    except ImportError:
-        raise ImportError(
-            "WorldMirror class not found. Please install:\n"
-            "https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror"
+    from huggingface_hub import snapshot_download
+    repo_root = snapshot_download(repo_id=model_name, allow_patterns=[f"{subfolder}/*"])
+    resolved = os.path.join(repo_root, subfolder)
+    if not _has_model_files(resolved):
+        raise FileNotFoundError(
+            f"Downloaded repo '{model_name}' but subfolder '{subfolder}' does not "
+            f"contain model.safetensors + config. Check the repo/subfolder name."
         )
+    return resolved
+
+
+def _load_model_config(model_dir: str) -> dict:
+    """Load WorldMirror constructor kwargs from config.json (or config.yaml,
+    for parity with the upstream loader's local-training-checkpoint path)."""
+    json_path = os.path.join(model_dir, "config.json")
+    yaml_path = os.path.join(model_dir, "config.yaml")
+    if os.path.isfile(json_path):
+        import json as _json
+        with open(json_path) as f:
+            return _json.load(f)
+    elif os.path.isfile(yaml_path):
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load(yaml_path)
+        model_cfg = cfg.wrapper.model if hasattr(cfg, "wrapper") else cfg.model
+        out = OmegaConf.to_container(model_cfg, resolve=True)
+        out.pop("_target_", None)
+        return out
+    raise FileNotFoundError(f"No config.json or config.yaml in {model_dir}")
+
+
+def _load_state_dict_selective(model, ckpt_state: dict, source_name: str = "checkpoint") -> None:
+    """Merge only shape-matching keys from ckpt_state into model, then strict-load
+    the merged result -- exactly Tencent's own _load_state_dict_selective. A plain
+    strict load would fail outright on any key WorldMirror 2.0 doesn't (yet) use;
+    this mirrors what every param that DOES match actually receives, and reports
+    how many keys matched so a silent architecture mismatch doesn't go unnoticed."""
+    current = model.state_dict()
+    for key in current:
+        if key in ckpt_state and current[key].shape == ckpt_state[key].shape:
+            current[key] = ckpt_state[key]
+    model.load_state_dict(current, strict=True)
+    matched = sum(1 for k in current if k in ckpt_state and current[k].shape == ckpt_state[k].shape)
+    print(f"  Loaded {matched}/{len(current)} keys from {source_name}")
+
+
+def _load_worldmirror2(model_dir: str, device: str, precision: str) -> Any:
+    """Instantiate WorldMirror(**config) and load model.safetensors selectively --
+    the checkpoint's own config.json, not constructor defaults, must drive
+    architecture (see load_model()'s docstring for why that distinction matters)."""
+    import contextlib
+    from safetensors.torch import load_file as load_safetensors
+
+    @contextlib.contextmanager
+    def _ensure_path_priority():
+        _node_str = str(_custom_node_dir)
+        original_path = sys.path.copy()
+        for key in [k for k in sys.modules if k.startswith('src.')] + (['src'] if 'src' in sys.modules else []):
+            del sys.modules[key]
+        while _node_str in sys.path:
+            sys.path.remove(_node_str)
+        sys.path.insert(0, _node_str)
+        try:
+            yield
+        finally:
+            sys.path[:] = original_path
+
+    with _ensure_path_priority():
+        from src.models.models.worldmirror import WorldMirror
+
+    model_cfg = _load_model_config(model_dir)
+    model = WorldMirror(**model_cfg)
+
+    state = load_safetensors(os.path.join(model_dir, "model.safetensors"))
+    _load_state_dict_selective(model, state, source_name=model_dir)
+    del state
 
     model = model.to(device)
-
     if precision == "fp16":
         model = model.half()
     elif precision == "bf16":

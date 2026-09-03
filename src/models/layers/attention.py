@@ -2,18 +2,36 @@
 #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
-import logging
-import os
-import warnings
-
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 import torch
 
-# from torch.nn.attention import SDPBackend
-
-XFORMERS_AVAILABLE = False
+# FlashAttention is a genuine CUDA-source-compile dependency (same class of
+# build-toolchain problem as gsplat -- needs the CUDA toolkit, hours to build
+# from source, no prebuilt wheel matching every torch/cuda/python combo).
+# Made optional here: SDPA (torch.nn.functional.scaled_dot_product_attention)
+# handles bf16/fp16 inputs correctly too -- the original dtype-based branching
+# in _apply_attention() below looks like a pure throughput optimization
+# (flash-attn is faster for reduced precision), not a correctness requirement,
+# so falling back to SDPA when flash-attn isn't installed keeps this pack
+# usable without a multi-hour custom build for every new deployment target.
+_HAS_FLASH_ATTN = False
+_USE_FLASH_ATTN_V3 = False
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+    _HAS_FLASH_ATTN = True
+    _USE_FLASH_ATTN_V3 = True
+except ImportError:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_func_v2
+        _HAS_FLASH_ATTN = True
+    except ImportError:
+        print("[ComfyUI-HunyuanWorld-Mirror] flash-attn not installed -- falling back to "
+              "PyTorch SDPA for all attention (slower, but functionally correct).")
+from ...comm.padding import minimal_pad_to_divisible, depad_by_length, pad_by_length
+import torch.distributed as dist
+from ...comm.communication import _All2All, _Allgather
 
 
 class Attention(nn.Module):
@@ -45,46 +63,85 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def _compute_qkv(self, x: Tensor):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+        return q, k, v, B, N, C
 
-        if self.rope is not None:
-            q = self.rope(q, pos)
-            k = self.rope(k, pos)
+    def _apply_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        if _HAS_FLASH_ATTN and (q.dtype == torch.bfloat16 or q.dtype == torch.float16):
+            if q.is_contiguous():
+                q = q.transpose(1,2)
+            else:
+                q = q.transpose(1, 2).contiguous()
+            if k.is_contiguous():
+                k = k.transpose(1, 2)
+            else:
+                k = k.transpose(1, 2).contiguous()
+            if v.is_contiguous():
+                v = v.transpose(1, 2)
+            else:
+                v = v.transpose(1, 2).contiguous()
+            if _USE_FLASH_ATTN_V3:
+                x = flash_attn_func_v3(q, k, v)
+            else:
+                x = flash_attn_func_v2(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            if x.is_contiguous():
+                x = x.transpose(1, 2)
+            else:
+                x = x.transpose(1, 2).contiguous()
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        return x
 
-        # orig_dtype = q.dtype
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-
-        # with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        #     with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-        # if x.dtype != orig_dtype:
-        #     x = x.to(orig_dtype)
-
+    def _project_output(self, x: Tensor, B: int, N: int, C: int) -> Tensor:
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
+    def forward(self, x: Tensor, pos=None) -> Tensor:
+        q, k, v, B, N, C = self._compute_qkv(x)
+
+        if self.rope is not None:
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+
+        x = self._apply_attention(q, k, v)
+        return self._project_output(x, B, N, C)
+
+class DistAttention(Attention):
+    def forward(self, x: Tensor, pos=None, sp_size=1, sp_group=None, padding_tokens=0) -> Tensor:
+
+        q, k, v, B, N, C = self._compute_qkv(x)
+
+        if sp_size>1:
+
+            q = _All2All.apply(q,1,2,sp_group,False)
+            k = _All2All.apply(k,1,2,sp_group,False)
+            v = _All2All.apply(v,1,2,sp_group,False)
+            q = depad_by_length(q,padding_tokens,2)
+            k = depad_by_length(k,padding_tokens,2)
+            v = depad_by_length(v,padding_tokens,2)
+
+        if self.rope is not None:
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+
+        x = self._apply_attention(q, k, v)
+
+        if sp_size>1:
+            x = pad_by_length(x,padding_tokens,2,0)
+            x = _All2All.apply(x,2,1,sp_group,False)
+
+        return self._project_output(x, B, N, C)
+
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:
         assert pos is None
-        if not XFORMERS_AVAILABLE:
-            if attn_bias is not None:
-                raise AssertionError("xFormers is required for using nested tensors")
-            return super().forward(x)
-
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-
-        q, k, v = unbind(qkv, 2)
-
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-        x = x.reshape([B, N, C])
-
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        if attn_bias is not None:
+            raise AssertionError("xFormers is required for using nested tensors")
+        return super().forward(x)

@@ -4,11 +4,147 @@ from typing import List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-from src.models.utils.grid import create_uv_grid, position_grid_to_embed
+from ..layers.mlp import MlpFP32
+from ..utils.grid import create_uv_grid, position_grid_to_embed
 
 
-class DPTHead(nn.Module):
+class _BaseDPTHead(nn.Module):
+    """Base class with shared DPT feature extraction: projects, resize, scratch, and fusion."""
+
+    def __init__(
+        self,
+        dim_in: int,
+        patch_size: int = 14,
+        features: int = 256,
+        out_channels: List[int] = [256, 512, 1024, 1024],
+        pos_embed: bool = True,
+        down_ratio: int = 1,
+        gradient_checkpoint: bool = False,
+        _cast_pos_embed_dtype: bool = True,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.pos_embed = pos_embed
+        self.down_ratio = down_ratio
+        self.gradient_checkpoint = gradient_checkpoint
+        self._cast_pos_embed_dtype = _cast_pos_embed_dtype
+
+        self.norm = nn.LayerNorm(dim_in)
+        self.projects = nn.ModuleList([
+            nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0)
+            for oc in out_channels
+        ])
+        self.resize_layers = nn.ModuleList([
+            nn.ConvTranspose2d(
+                in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
+            ),
+            nn.ConvTranspose2d(
+                in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
+            ),
+            nn.Identity(),
+            nn.Conv2d(
+                in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
+            ),
+        ])
+        self.scratch = _make_scratch(out_channels, features, expand=False)
+        self.scratch.stem_transpose = None
+        self.scratch.refinenet1 = _make_fusion_block(features)
+        self.scratch.refinenet2 = _make_fusion_block(features)
+        self.scratch.refinenet3 = _make_fusion_block(features)
+        self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
+
+        head_features_1 = features
+        self.scratch.output_conv1 = nn.Conv2d(
+            head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1
+        )
+
+    def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
+        patch_w = x.shape[-1]
+        patch_h = x.shape[-2]
+        pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
+        pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
+        pos_embed = pos_embed * ratio
+        pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
+        if self._cast_pos_embed_dtype:
+            pos_embed = pos_embed.to(x.dtype)
+        return x + pos_embed
+
+    def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        layer_1, layer_2, layer_3, layer_4 = features
+
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+        layer_3_rn = self.scratch.layer3_rn(layer_3)
+        layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        del layer_4_rn, layer_4
+
+        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        del layer_3_rn, layer_3
+
+        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
+        del layer_2_rn, layer_2
+
+        out = self.scratch.refinenet1(out, layer_1_rn)
+        del layer_1_rn, layer_1
+
+        out = self.scratch.output_conv1(out)
+        return out
+
+    def _extract_fused_features(
+        self,
+        token_list: List[torch.Tensor],
+        B: int,
+        S: int,
+        H: int,
+        W: int,
+        patch_start_idx: int,
+        frame_start: int = None,
+        frame_end: int = None,
+    ) -> torch.Tensor:
+        """Extract multi-scale features from tokens, fuse via scratch network, and upsample."""
+        ph = H // self.patch_size
+        pw = W // self.patch_size
+
+        feats = []
+        for proj, resize, tokens in zip(self.projects, self.resize_layers, token_list):
+            patch_tokens = tokens[:, :, patch_start_idx:]
+            if frame_start is not None and frame_end is not None:
+                patch_tokens = patch_tokens[:, frame_start:frame_end]
+
+            patch_tokens = patch_tokens.reshape(B * S, -1, patch_tokens.shape[-1])
+            patch_tokens = self.norm(patch_tokens)
+
+            feat = patch_tokens.permute(0, 2, 1).reshape(B * S, patch_tokens.shape[-1], ph, pw)
+            feat = proj(feat)
+
+            if self.pos_embed:
+                feat = self._apply_pos_embed(feat, W, H)
+            feat = resize(feat)
+            feats.append(feat)
+
+        fused = checkpoint(self.scratch_forward, feats, use_reentrant=False) if self.gradient_checkpoint else self.scratch_forward(feats)
+        _interpolate_fn = lambda t: custom_interpolate(
+            t,
+            size=(
+                int(ph * self.patch_size / self.down_ratio),
+                int(pw * self.patch_size / self.down_ratio)
+            ),
+            mode="bilinear",
+            align_corners=True,
+        )
+        fused = checkpoint(_interpolate_fn, fused, use_reentrant=False) if self.gradient_checkpoint else _interpolate_fn(fused)
+
+        if self.pos_embed:
+            fused = self._apply_pos_embed(fused, W, H)
+
+        return fused
+
+
+class DPTHead(_BaseDPTHead):
     """
     # DPT Head for dense prediction tasks.
 
@@ -41,69 +177,52 @@ class DPTHead(nn.Module):
         out_channels: List[int] = [256, 512, 1024, 1024],
         pos_embed: bool = True,
         down_ratio: int = 1,
-        is_gsdpt: bool = False
+        is_gsdpt: bool = False,
+        enable_depth_mask: bool = False,
+        gradient_checkpoint: bool = False,
     ) -> None:
-        super(DPTHead, self).__init__()
-        self.patch_size = patch_size
-        self.activation = activation
-        self.pos_embed = pos_embed
-        self.down_ratio = down_ratio
-        self.is_gsdpt = is_gsdpt
-
-        self.norm = nn.LayerNorm(dim_in)
-        # Projection layers for each output channel from tokens.
-        self.projects = nn.ModuleList([nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) for oc in out_channels])
-        # Resize layers for upsampling feature maps.
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
-                ),
-                nn.Identity(),
-                nn.Conv2d(
-                    in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
-                ),
-            ]
+        super().__init__(
+            dim_in=dim_in, patch_size=patch_size, features=features,
+            out_channels=out_channels, pos_embed=pos_embed,
+            down_ratio=down_ratio, gradient_checkpoint=gradient_checkpoint,
         )
-        self.scratch = _make_scratch(out_channels, features, expand=False)
+        self.activation = activation
+        self.is_gsdpt = is_gsdpt
+        self.enable_depth_mask = enable_depth_mask
 
-        # Attach additional modules to scratch.
-        self.scratch.stem_transpose = None
-
-        self.scratch.refinenet1 = _make_fusion_block(features)
-        self.scratch.refinenet2 = _make_fusion_block(features)
-        self.scratch.refinenet3 = _make_fusion_block(features)
-        self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
-
-        head_features_1 = features
         head_features_2 = 32
+        conv2_in_channels = features // 2
 
+        self.scratch.output_conv2 = nn.Sequential(
+            nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
+        )
         if self.is_gsdpt:
-            self.scratch.output_conv1 = nn.Conv2d(head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1)
-            conv2_in_channels = head_features_1 // 2
-            self.scratch.output_conv2 = nn.Sequential(
-                nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
-            )
             self.input_merger = nn.Sequential(
                 nn.Conv2d(3, conv2_in_channels, 7, 1, 3),
                 nn.ReLU()
                 )
-        else:
-            self.scratch.output_conv1 = nn.Conv2d(
-                head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1
-            )
-            conv2_in_channels = head_features_1 // 2
-            self.scratch.output_conv2 = nn.Sequential(
-                nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
-            )
 
+    def to(self, *args, **kwargs):
+        self.norm = self.norm.to(*args, **kwargs)
+        self.projects = self.projects.to(*args, **kwargs)
+        self.resize_layers = self.resize_layers.to(*args, **kwargs)
+        if self.is_gsdpt:
+            self.input_merger = self.input_merger.to(*args, **kwargs)
+        for key in ('layer1_rn', 'layer2_rn', 'layer3_rn', 'layer4_rn',
+                    'refinenet1', 'refinenet2', 'refinenet3', 'refinenet4',
+                    'output_conv1'):
+            if not hasattr(self.scratch, key):
+                continue
+            setattr(self.scratch, key, getattr(self.scratch, key).to(*args, **kwargs))
+
+        # keep output_conv2 in FP32
+        args, kwargs = MlpFP32.map_to_args_to_float(args, kwargs)
+        self.scratch.output_conv2 = self.scratch.output_conv2.to(*args, **kwargs)
+
+        return self
+    
     def forward(
         self,
         token_list: List[torch.Tensor],
@@ -137,29 +256,57 @@ class DPTHead(nn.Module):
         preds_chunks = []
         conf_chunks = []
         gs_chunks = []
+        depth_mask_chunks = []
 
         for frame_start in range(0, S, frames_chunk_size):
             frame_end = min(frame_start + frames_chunk_size, S)
             
             if self.is_gsdpt:
-                gs, preds, conf = self._forward_impl(
-                    token_list, images, patch_start_idx, frame_start, frame_end
-                )
-                gs_chunks.append(gs)
-                preds_chunks.append(preds)
-                conf_chunks.append(conf)
+                if self.enable_depth_mask:
+                    gs, preds, conf, depth_mask = self._forward_impl(
+                        token_list, images, patch_start_idx, frame_start, frame_end
+                    )
+                    gs_chunks.append(gs)
+                    preds_chunks.append(preds)
+                    conf_chunks.append(conf)
+                    depth_mask_chunks.append(depth_mask)
+                else:
+                    gs, preds, conf = self._forward_impl(
+                        token_list, images, patch_start_idx, frame_start, frame_end
+                    )
+                    gs_chunks.append(gs)
+                    preds_chunks.append(preds)
+                    conf_chunks.append(conf)
             else:
-                preds, conf = self._forward_impl(
-                    token_list, images, patch_start_idx, frame_start, frame_end
-                )
-                preds_chunks.append(preds)
-                conf_chunks.append(conf)
+                if self.enable_depth_mask:
+                    preds, conf, depth_mask = self._forward_impl(
+                        token_list, images, patch_start_idx, frame_start, frame_end
+                    )
+                    preds_chunks.append(preds)
+                    conf_chunks.append(conf)
+                    depth_mask_chunks.append(depth_mask)
+                else:
+                    preds, conf = self._forward_impl(
+                        token_list, images, patch_start_idx, frame_start, frame_end
+                    )
+                    preds_chunks.append(preds)
+                    conf_chunks.append(conf)
 
         # Concatenate chunks along frame dimension
         if self.is_gsdpt:
-            return torch.cat(gs_chunks, dim=1), torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1), 
+            if self.enable_depth_mask:
+                return (
+                    torch.cat(gs_chunks, dim=1),
+                    torch.cat(preds_chunks, dim=1),
+                    torch.cat(conf_chunks, dim=1),
+                    torch.cat(depth_mask_chunks, dim=1),
+                )
+            return torch.cat(gs_chunks, dim=1), torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1)
         else:
-            return torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1)
+            if self.enable_depth_mask:
+                return torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1), torch.cat(depth_mask_chunks, dim=1)
+            else:
+                return torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1)
 
     def _forward_impl(
         self,
@@ -183,56 +330,20 @@ class DPTHead(nn.Module):
             If is_gsdpt: (features, preds, conf)
             Else: (preds, conf)
         """
-        # Slice frames if chunking
         if frame_start is not None and frame_end is not None:
             images = images[:, frame_start:frame_end].contiguous()
 
         B, S, _, H, W = images.shape
-        ph = H // self.patch_size  # patch height
-        pw = W // self.patch_size  # patch width
 
-        # Extract and project multi-level features
-        feats = []
-        for proj, resize, tokens in zip(self.projects, self.resize_layers, token_list):
-            # Extract patch tokens
-            patch_tokens = tokens[:, :, patch_start_idx:]
-            if frame_start is not None and frame_end is not None:
-                patch_tokens = patch_tokens[:, frame_start:frame_end]
-            
-            # Reshape to [B*S, N_patches, C]
-            patch_tokens = patch_tokens.reshape(B * S, -1, patch_tokens.shape[-1])
-            patch_tokens = self.norm(patch_tokens)
-            
-            # Convert to 2D feature map [B*S, C, ph, pw]
-            feat = patch_tokens.permute(0, 2, 1).reshape(B * S, patch_tokens.shape[-1], ph, pw)
-            feat = proj(feat)
-
-            if self.pos_embed:
-                feat = self._apply_pos_embed(feat, W, H)
-            feat = resize(feat)
-            feats.append(feat)
-
-        # Fuse multi-level features
-        fused = self.scratch_forward(feats)
-        fused = custom_interpolate(
-            fused,
-            size=(
-                int(ph * self.patch_size / self.down_ratio),
-                int(pw * self.patch_size / self.down_ratio)
-            ),
-            mode="bilinear",
-            align_corners=True,
-        )
-
-        # Apply positional embedding after upsampling
-        if self.pos_embed:
-            fused = self._apply_pos_embed(fused, W, H)
+        fused = self._extract_fused_features(token_list, B, S, H, W, patch_start_idx, frame_start, frame_end)
 
         # Generate predictions and confidence
         if self.is_gsdpt:
-            # GSDPT: output features, predictions, and confidence
-            out = self.scratch.output_conv2(fused)
-            preds, conf = self.activate_head(out, activation=self.activation)
+            out = self.scratch.output_conv2(fused.float().contiguous())
+            if self.enable_depth_mask:
+                preds, conf, depth_mask = self.activate_head(out, activation=self.activation)
+            else:
+                preds, conf = self.activate_head(out, activation=self.activation)
             preds = preds.reshape(B, S, *preds.shape[1:])
             conf = conf.reshape(B, S, *conf.shape[1:])
             
@@ -240,59 +351,24 @@ class DPTHead(nn.Module):
             img_flat = images.reshape(B * S, -1, H, W)
             img_feat = self.input_merger(img_flat)
             fused = fused + img_feat
-            fused = fused.reshape(B, S, *fused.shape[1:])
+            fused = fused.reshape(B, S, *fused.shape[1:]).float().contiguous()
+            if self.enable_depth_mask:
+                depth_mask = depth_mask.reshape(B, S, *depth_mask.shape[1:])
+                return fused, preds, conf, depth_mask
             return fused, preds, conf
         else:
-            # Standard: output predictions and confidence
-            out = self.scratch.output_conv2(fused)
-            preds, conf = self.activate_head(out, activation=self.activation)
-            preds = preds.reshape(B, S, *preds.shape[1:])
-            conf = conf.reshape(B, S, *conf.shape[1:])
-            return preds, conf
-
-    def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
-        """
-        Apply positional embedding to tensor x.
-        """
-        patch_w = x.shape[-1]
-        patch_h = x.shape[-2]
-        pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
-        pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
-        pos_embed = pos_embed * ratio
-        pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
-        return x + pos_embed
-
-    def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass through the fusion blocks.
-
-        Args:
-            features (List[Tensor]): List of feature maps from different layers.
-
-        Returns:
-            Tensor: Fused feature map.
-        """
-        layer_1, layer_2, layer_3, layer_4 = features
-
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
-
-        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        del layer_4_rn, layer_4
-
-        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
-        del layer_3_rn, layer_3
-
-        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
-        del layer_2_rn, layer_2
-
-        out = self.scratch.refinenet1(out, layer_1_rn)
-        del layer_1_rn, layer_1
-
-        out = self.scratch.output_conv1(out)
-        return out
+            out = self.scratch.output_conv2(fused.float().contiguous())
+            if self.enable_depth_mask:
+                preds, conf, depth_mask = self.activate_head(out, activation=self.activation)
+                preds = preds.reshape(B, S, *preds.shape[1:])
+                conf = conf.reshape(B, S, *conf.shape[1:])
+                depth_mask = depth_mask.reshape(B, S, *depth_mask.shape[1:])
+                return preds, conf, depth_mask
+            else:
+                preds, conf = self.activate_head(out, activation=self.activation)
+                preds = preds.reshape(B, S, *preds.shape[1:])
+                conf = conf.reshape(B, S, *conf.shape[1:])
+                return preds, conf
 
     def activate_head(self, out_head: torch.Tensor, activation: str = "inv_log+expp1") -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -306,11 +382,18 @@ class DPTHead(nn.Module):
             Tuple of (attribute tensor, confidence tensor)
         """
         # Parse activation string
-        act_attr, act_conf = (activation.split("+") if "+" in activation else (activation, "expp1"))
+        if self.enable_depth_mask:
+            act_attr, act_conf, act_depth_mask = (activation.split("+") if "+" in activation else (activation, "expp1", "linear"))
 
-        # (B,C,H,W) -> (B,H,W,C)
-        feat = out_head.permute(0, 2, 3, 1)
-        attr, conf = feat[..., :-1], feat[..., -1]
+            # (B,C,H,W) -> (B,H,W,C)
+            feat = out_head.permute(0, 2, 3, 1)
+            attr, conf, depth_mask = feat[..., :-2], feat[..., -2], feat[..., -1]
+        else:
+            act_attr, act_conf = (activation.split("+") if "+" in activation else (activation, "expp1"))
+
+            # (B,C,H,W) -> (B,H,W,C)
+            feat = out_head.permute(0, 2, 3, 1)
+            attr, conf = feat[..., :-1], feat[..., -1]
 
         # Map point activations to lambdas for clarity and conciseness
         attr_activations = {
@@ -340,8 +423,18 @@ class DPTHead(nn.Module):
         if act_conf not in conf_activations:
             raise ValueError(f"Unknown confidence activation: {act_conf}")
         conf_out = conf_activations[act_conf](conf)
-
-        return attr_out, conf_out
+        
+        if self.enable_depth_mask:
+            depth_mask_activations = {
+                "sigmoid": torch.sigmoid,
+                "linear": lambda x: x,
+            }
+            if act_depth_mask not in depth_mask_activations:
+                raise ValueError(f"Unknown depth mask activation: {act_depth_mask}")
+            depth_mask_out = depth_mask_activations[act_depth_mask](depth_mask)
+            return attr_out, conf_out, depth_mask_out
+        else:
+            return attr_out, conf_out
     
     def _apply_inverse_log_transform(self, input_tensor: torch.Tensor) -> torch.Tensor:
         """
