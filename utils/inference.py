@@ -274,9 +274,23 @@ def _resolve_wm2_model_dir(model_name: str, subfolder: str, cache_dir: Optional[
          platform limitation: concept_mapping isn't guaranteed across
          Graydient machine classes).
     """
+    # Two ways to find "ComfyUI root": walk up from this file's real path
+    # (breaks if the custom node dir is a symlink/junction -- __file__
+    # resolves through it to the real underlying path, so .parent.parent's
+    # own parent is the junction TARGET's parent, not "custom_nodes"; confirmed
+    # live on a junction-based local dev install), and walk up from the
+    # process cwd (ComfyUI's own launch convention runs `python main.py` from
+    # the ComfyUI root, so this catches exactly the case the first check
+    # misses). Try both rather than assuming either one is reliable alone.
+    candidate_comfy_roots = []
     current_dir = Path(__file__).parent.parent  # ComfyUI-HunyuanWorld-Mirror directory
     if current_dir.parent.name == "custom_nodes":
-        comfy_root = current_dir.parent.parent
+        candidate_comfy_roots.append(current_dir.parent.parent)
+    cwd = Path.cwd()
+    if (cwd / "custom_nodes").is_dir() and (cwd / "models").is_dir():
+        candidate_comfy_roots.append(cwd)
+
+    for comfy_root in candidate_comfy_roots:
         local_candidate = comfy_root / "models" / "HunyuanWorld-Mirror" / subfolder
         if local_candidate.is_dir() and _has_model_files(str(local_candidate)):
             print(f"[Init] Found local model at {local_candidate}")
